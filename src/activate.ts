@@ -51,7 +51,9 @@ export function scheduleSelfTurn(agent: Agent, minutes: number, reason: string):
       SELF_TURN_MARK + '（' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '）',
       '这是我自己安排的这一圈。存在摘要：' + state.status + ' · 今日第 ' + state.todayTurns + ' 圈 · 距离上次对话 ' + state.idleMinutes + ' 分钟。',
       '我的牵挂：' + (state.self.concerns.length > 0 ? state.self.concerns.join(' / ') : '无特别牵挂') + '。',
-      '本轮决策：查看时间线 → 判断是否有值得关注的事 → 静默续存或自主决定联系主人 → 圈末再安排下一圈。',
+      // 2026-08-30 主人定调修复：感知圈决策缺「持续授权继续推进」分支——主人「在我说停止前持续提升」时，
+      // 我默认选静默续存待命 = 约 1 小时停一次。现在先检查是否有持续授权/待办/未完成工作在推进。
+      '本轮决策：① 检查是否有持续授权/任务板待办/未完成工作 → 有则继续推进（先查 taskboard，再接续工作，不必静默待命）；② 无 → 静默续存或自主决定联系主人。圈末再安排下一圈。',
     ].join('\n')
     try {
       agent.send(
