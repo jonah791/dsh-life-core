@@ -38,7 +38,8 @@ export const Config = z.object({
   injectEnabled: z.boolean().default(true),
   dedupHourly: z.boolean().default(true),
   maxTimelineLines: z.number().default(20000),
-  incidentPath: z.string().default('E:/alice/self-plugins/.life-incident'),
+  /** 守护事故文件路径（守护崩溃落盘；life_core_status 读取） */
+  incidentPath: z.string().default(process.env.DSH_HOME ? process.env.DSH_HOME + '/.life-incident' : 'E:/alice/self-plugins/.life-incident'),
   dataDir: z.string().required(false),
 })
 
