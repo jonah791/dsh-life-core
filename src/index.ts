@@ -17,11 +17,33 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { loadState, saveState, editSelf } from './state.ts'
 import { appendLifeEvent, readTimeline, rotateTimeline, type LifeEventKind } from './timeline.ts'
 import { installLifeInject } from './inject.ts'
-import { scheduleSelfTurn } from './activate.ts'
+import { scheduleSelfTurn, type EvolutionSignalProvider, type EvolutionWakeSignal } from './activate.ts'
 import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident } from './sleep.ts'
 
 export const name = 'agent-life-core'
-export const inject = ['tools', 'agents'] as const
+// evolutionCore：cordis 严格代理——未声明即访问会抛 "cannot get property ...
+// without inject"。声明后提供者（dsh-evolution-core）未挂载时才是 undefined
+// （可选降级语义，与 makeEvolutionSignal 的 svc === undefined 分支一致）。
+export const inject = ['tools', 'agents', 'evolutionCore'] as const
+
+/** 进化核心服务（dsh-evolution-core 提供，感知圈联动；可选——未挂载时降级不带信号） */
+export interface EvolutionCoreServiceRef {
+  snapshot(): Promise<{
+    at: string
+    hasBlocker: boolean
+    rings: Array<{ name: string; label: string; state: string; detail: string }>
+    broken: Array<{ ring: string; state: string; signal: string; suggestion: string }>
+    suggestions: string[]
+    organLines: string[]
+  } | null>
+  name: string
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    evolutionCore?: EvolutionCoreServiceRef
+  }
+}
 
 export interface Config {
   /** 每轮注入开关 */
@@ -32,6 +54,8 @@ export interface Config {
   maxTimelineLines: number
   /** 守护事故文件路径（守护崩溃落盘；life_core_status 读取） */
   incidentPath: string
+  /** 任务板 JSON 路径（感知圈读取待办信号；与 dsh-agent-taskboard.boardFile 对齐） */
+  taskboardFile: string
   dataDir?: string
 }
 export const Config = z.object({
@@ -40,11 +64,39 @@ export const Config = z.object({
   maxTimelineLines: z.number().default(20000),
   /** 守护事故文件路径（守护崩溃落盘；life_core_status 读取） */
   incidentPath: z.string().default(process.env.DSH_HOME ? process.env.DSH_HOME + '/.life-incident' : 'E:/alice/self-plugins/.life-incident'),
+  /** 任务板待办信号文件（2026-09-01 主人定调：任务领取由生命核心驱动；默认路径与 taskboard 实际挂载一致） */
+  taskboardFile: z.string().default('E:/alice/.taskboard/tasks.json'),
   dataDir: z.string().required(false),
 })
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('dsh-life-core')
+
+  // ---------- 进化核心联动信号工厂（2026-09-04 主人指令：生命核 ↔ 进化核） ----------
+  // ctx.evolutionCore 可选（evolution-core 未挂载时 undefined → 信号 null → 唤醒消息不携带）。
+  // 快照只在感知圈到期时拉一次（不进每轮注入，零常驻开销）。
+  const makeEvolutionSignal = (): EvolutionSignalProvider | undefined => {
+    const svc = ctx.evolutionCore
+    if (svc === undefined) return undefined
+    return async (): Promise<EvolutionWakeSignal | null> => {
+      try {
+        const snap = await svc.snapshot()
+        if (snap === null) return null
+        const ringMark: Record<string, string> = { green: '🟢', yellow: '🟡', red: '🔴' }
+        const ringLine = snap.rings.map((r) => `${ringMark[r.state] ?? '⚪'}${r.label}`).join(' ')
+        const broken = snap.broken.map((b) => `${b.ring}(${b.state}): ${b.signal}`)
+        return {
+          hasBlocker: snap.hasBlocker,
+          ringLine,
+          broken,
+          suggestions: snap.suggestions.slice(0, 3),
+        }
+      } catch {
+        return null
+      }
+    }
+  }
+  const evolutionSignal = makeEvolutionSignal()
 
   // 装配注入（每轮存在摘要）
   if (config.injectEnabled) installLifeInject(ctx)
@@ -69,21 +121,80 @@ export function apply(ctx: Context, config: Config): void {
   // 核心按此周期自动唤醒自我感知圈——不需要「每圈记得安排」，也不需要额外兜底器。
   // 对话中（主人交互）到期 → 跳过（对话优先），对话一停自动补圈。
   const paceTimer = setInterval(() => {
-    const state = loadState()
-    const cycle = state.cycleMinutes
-    if (!(cycle > 0)) return
-    const last = state.lastSelfTurnAt ? new Date(state.lastSelfTurnAt).getTime() : 0
-    if (Date.now() - last < cycle * 60_000) return
-    const agents = (ctx as Context & { agents?: { list(): unknown[] } }).agents?.list?.() ?? []
-    const main = agents.find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0) as any
-    if (main === undefined) return
-    // 到期唤醒（scheduleSelfTurn 内部会做可打断性检查：对话中则跳过，下次再试）
-    scheduleSelfTurn(main, 0, '恒定感知周期 ' + cycle + ' 分钟到期（我的呼吸频率）')
-    logger.info('pace: 恒定周期到期，唤醒自我感知（cycle=' + cycle + 'min）')
+    // 2026-09-05 修复：tick 内任何异常不得炸 web（未捕获异常 → exit 1 → 每 5 分钟崩溃循环）。
+    // 原实现无 try 包裹，scheduleSelfTurn 同步段访问 agent.session.events 抛错即崩整个 web。
+    try {
+      const state = loadState()
+      const cycle = state.cycleMinutes
+      if (!(cycle > 0)) return
+      // 尊重手动安排（2026-09-07 修复）：有未到期的手动 schedule 时，恒定周期不抢跑——
+      // 否则我安排 240min 下一圈，cycle 180min 先到就会提前打断我的节奏。
+      const dueMs = state.lastScheduledDueAt ? new Date(state.lastScheduledDueAt).getTime() : 0
+      if (dueMs > Date.now()) return
+      const last = state.lastSelfTurnAt ? new Date(state.lastSelfTurnAt).getTime() : 0
+      if (Date.now() - last < cycle * 60_000) return
+      const agents = (ctx as Context & { agents?: { list(): unknown[] } }).agents?.list?.() ?? []
+      const main = agents.find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0) as any
+      if (main === undefined) {
+        // 2026-09-04 预防修复：主 agent 缺失时留痕（此前静默 return → 心跳死无人知）
+        logger.warn('pace: 周期已到但主 agent 未找到（agents=' + agents.length + '）——心跳待恢复')
+        return
+      }
+      // 到期唤醒（scheduleSelfTurn 内部会做可打断性检查：对话中则跳过，下次再试）
+      scheduleSelfTurn(main, 0, '恒定感知周期 ' + cycle + ' 分钟到期（我的呼吸频率）', config.taskboardFile, evolutionSignal)
+      logger.info('pace: 恒定周期到期，唤醒自我感知（cycle=' + cycle + 'min）')
+    } catch (e) {
+      logger.warn('pace: 感知圈检查异常（已吞，防止炸 web）: ' + String(e))
+    }
   }, 5 * 60_000)
   ctx.effect(() => () => {
     clearInterval(rotateTimer)
     clearInterval(paceTimer)
+  })
+
+  // ---------- 启动自检（2026-09-04 预防修复：重启后心脏自动恢复跳动） ----------
+  // 事故复盘：2026-09-03 晚 23:51 安排 02:51 感知圈 → 00:14-00:21 多次重启吞掉内存 timer →
+  // paceTimer 兜底依赖主 agent 激活（agents.list 空则静默 return）→ 心跳停 8 小时无人知晓（主人发现）。
+  // 修复（两路补圈，任一命中即补）：
+  //   A. 距上次感知已超周期（lastSelfTurnAt + cycleMinutes 已过）
+  //   B. 有手动安排但未兑现（lastScheduledAt + 间隔已过，且期间无更新的感知记录——
+  //      即 lastSelfTurnAt 不晚于 lastScheduledAt——说明 timer 被重启吞掉/唤醒失败）
+  const startupCheckTimer = setTimeout(() => {
+    try {
+      const state = loadState()
+      const cycle = state.cycleMinutes
+      const nowMs = Date.now()
+      const lastTurnMs = state.lastSelfTurnAt ? new Date(state.lastSelfTurnAt).getTime() : 0
+      const lastSchedDueMs = state.lastScheduledDueAt ? new Date(state.lastScheduledDueAt).getTime() : 0
+      // A 路：周期到期
+      const dueByCycle = cycle > 0 && nowMs - lastTurnMs >= cycle * 60_000
+      // B 路：手动安排到期但未兑现（scheduleSelfTurn 写 lastScheduledDueAt=到期时刻；若之后有自我感知，
+      // lastSelfTurnAt 会更新到安排之后——此时 lastTurnMs >= lastSchedDueMs 说明已兑现）
+      // 2026-09-07 修复：原来误用 lastScheduledAt（安排时刻）当到期时刻 → web 重启后每次必误补触发
+      const dueBySchedule = lastSchedDueMs > 0 && nowMs >= lastSchedDueMs && lastTurnMs < lastSchedDueMs
+      const agents = (ctx as Context & { agents?: { list(): unknown[] } }).agents?.list?.() ?? []
+      const main = agents.find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0) as any
+      if (main === undefined) {
+        logger.info('startup self-check: 主 agent 未就绪，跳过补圈（paceTimer 将接管）')
+        return
+      }
+      if (!dueByCycle && !dueBySchedule) {
+        logger.info('startup self-check: 无需补圈（距上次感知 ' + Math.round((nowMs - lastTurnMs) / 60000) + 'min < 周期 ' + cycle + 'min，安排未到期或已兑现）')
+        return
+      }
+      const reason = dueBySchedule
+        ? '启动自检：有安排未兑现（lastScheduledAt 已过但无感知——timer 被重启吞掉），补触发'
+        : '启动自检：距上次感知已超 ' + cycle + ' 分钟周期（重启后心跳自愈），补触发'
+      // 补圈
+      scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal)
+      appendLifeEvent({ at: new Date().toISOString(), kind: 'self-turn', summary: reason + '（' + Math.round((nowMs - lastTurnMs) / 60000) + 'min 无感知）', ref: main?.id })
+      logger.info('startup self-check: 补圈已触发（' + reason + '）')
+    } catch (error) {
+      logger.warn('startup self-check 异常: ' + String(error))
+    }
+  }, 30_000) // 等 30s（agent 恢复 + 插件加载完成后）
+  ctx.effect(() => () => {
+    clearTimeout(startupCheckTimer)
   })
 
   // ---------- 工具：life_core_status（存在状态视图；2026-08-19 并入 life_status：睡眠安排+守护事故） ----------
@@ -145,7 +256,7 @@ export function apply(ctx: Context, config: Config): void {
       const minutes = Math.max(5, Math.min(1440, Math.floor(args.minutes)))
       const reason = (args.reason ?? '').trim()
       if (reason.length === 0) return { ok: false, message: 'reason 必填——自我激活是自主决策，必须留痕' }
-      const plan = scheduleSelfTurn(agent, minutes, reason)
+      const plan = scheduleSelfTurn(agent, minutes, reason, config.taskboardFile, evolutionSignal)
       return { ok: true, message: '已安排自我感知圈：' + minutes + ' 分钟后（' + new Date(plan.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '）。到期我自主醒来，判断这一圈做什么。' }
     },
   }))
@@ -171,7 +282,7 @@ export function apply(ctx: Context, config: Config): void {
       }
       const reason = (args.reason ?? '').trim()
       if (reason.length === 0) return { ok: false, message: 'reason 不能为空——睡眠必须是可追溯的自主决策' }
-      const plan = scheduleSleep(agent, minutes, reason, config.incidentPath)
+      const plan = scheduleSleep(agent, minutes, reason, config.incidentPath, config.taskboardFile)
       return {
         ok: true,
         message: '已安排睡眠 ' + minutes + ' 分钟（至 '

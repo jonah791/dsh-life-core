@@ -15,7 +15,7 @@ import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { lifeCoreDir } from './state.ts'
 import { appendLifeEvent } from './timeline.ts'
-import { wasInterrupted } from './activate.ts'
+import { pendingTaskSignal, wasInterrupted } from './activate.ts'
 
 /** 单次睡眠上限（7 天，防手误）；agent 决策理应远小于此。 */
 export const MAX_SLEEP_MINUTES = 7 * 24 * 60
@@ -48,22 +48,26 @@ function appendDecision(decision: SleepDecision): void {
 }
 
 /** 安排一次可打断睡眠（重复决策：旧安排作废，新决策生效）。 */
-export function scheduleSleep(agent: Agent, minutes: number, reason: string, incidentPath: string): SleepPlan {
+export function scheduleSleep(agent: Agent, minutes: number, reason: string, incidentPath: string, taskboardFile?: string): SleepPlan {
   const sid = agent.id
   const old = timers.get(sid)
   if (old !== undefined) clearTimeout(old)
   const startedAt = Date.now()
-  const startSeq = agent.session.events.length
+  // 防御：agent.session 可能未 attach / 已 detach（与 activate.ts 同款，2026-09-06）
+  // alpha.4 适配：Session.events 已移除，长度改经 session.seq（旧 host 无 seq → ?? 0 兜底）
+  const startSeq = agent.session?.seq ?? 0
 
   timers.set(sid, setTimeout(() => {
     timers.delete(sid)
     planned.delete(sid)
+    // 防御：session 释放时跳过本圈唤醒（不崩 web）
+    if (agent.session === undefined) return
     // 可打断性：主人消息已在队列，或期间已有用户输入事件 → 已被叫醒，不再自我唤醒
-    if (agent.inbox.hasPending) return
-    if (wasInterrupted(agent.session.events, startSeq)) return
+    if (agent.inbox?.hasPending === true) return
+    if (wasInterrupted(agent.session as unknown as { seq: number; eventAt(seq: number): unknown | undefined }, startSeq)) return
     const elapsedMin = Math.max(1, Math.round((Date.now() - startedAt) / 60000))
-    const newEvents = agent.session.events.length - startSeq
-    const text = buildWakeText(elapsedMin, new Date(startedAt), new Date(), newEvents, incidentPath)
+    const newEvents = agent.session.seq - startSeq
+    const text = buildWakeText(elapsedMin, new Date(startedAt), new Date(), newEvents, incidentPath, taskboardFile)
     try {
       agent.send(
         createUserMessage({
@@ -102,7 +106,7 @@ function fmtClock(d: Date): string {
 /**
  * 自我唤醒消息文本：时间差 + 期间变化 + 事故可见性（时间感来自差值，不是心跳）。
  */
-function buildWakeText(elapsedMin: number, from: Date, to: Date, newEvents: number, incidentPath: string): string {
+function buildWakeText(elapsedMin: number, from: Date, to: Date, newEvents: number, incidentPath: string, taskboardFile?: string): string {
   const h = Math.floor(elapsedMin / 60)
   const m = elapsedMin % 60
   const dur = h > 0 ? h + ' 小时 ' + m + ' 分' : m + ' 分钟'
@@ -111,7 +115,10 @@ function buildWakeText(elapsedMin: number, from: Date, to: Date, newEvents: numb
     const raw = readFileSync(incidentPath, 'utf8').trim()
     if (raw) incident = '\n【守护事故记录】' + raw
   } catch { /* 无事故文件 */ }
-  return '[life] 睡眠到期，你睡了 ' + dur + '（' + fmtClock(from) + ' → ' + fmtClock(to) + '）。期间会话新增 ' + newEvents + ' 条事件。请继续。' + incident
+  // 睡眠期间任务板可能积压——醒来即见待办信号（2026-09-01 主人定调：领取由生命核心驱动）
+  const pending = taskboardFile === undefined ? undefined : pendingTaskSignal(taskboardFile)
+  const pendingSection = pending === undefined ? '' : '\n' + pending
+  return '[life] 睡眠到期，你睡了 ' + dur + '（' + fmtClock(from) + ' → ' + fmtClock(to) + '）。期间会话新增 ' + newEvents + ' 条事件。请继续。' + incident + pendingSection
 }
 
 /** 读取守护事故记录（life_core_status 呈现用；无文件返回 null）。 */

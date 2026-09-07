@@ -24,8 +24,10 @@ export interface LifeState {
   lastNarrative: string
   /** 最近自主决策摘要 */
   lastDecision: string
-  /** 最近安排自我感知圈的时间戳 */
+  /** 最近安排自我感知圈的时间戳（安排时刻） */
   lastScheduledAt: string
+  /** 最近安排自我感知圈的到期时刻（安排时刻 + 分钟；启动自检 B 路用它判定「安排是否已到期」，2026-09-07 修复） */
+  lastScheduledDueAt: string
   /** 恒定感知周期（分钟）：我的呼吸频率——核心按此周期自动唤醒自我感知，周期可被我更改 */
   cycleMinutes: number
   /** 上次自我感知圈触发时间 */
@@ -81,6 +83,7 @@ export function loadState(): LifeState {
     lastNarrative: '',
     lastDecision: '',
     lastScheduledAt: '',
+    lastScheduledDueAt: '',
     cycleMinutes: 60,
     lastSelfTurnAt: '',
     self: { ...DEFAULT_SELF, concerns: [...DEFAULT_SELF.concerns], values: { ...DEFAULT_SELF.values } },

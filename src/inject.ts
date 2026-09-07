@@ -18,7 +18,9 @@ export function isSelfTurn(text: string): boolean {
 
 export function installLifeInject(ctx: Context): void {
   const bySession = new Map<string, string>()
-  ctx.on('agent/pre-step', async (payload, next) => {
+  // DSH alpha.1 类型漂移（2026-09-04）：agent/pre-step 事件重载后 TS 无法匹配监听器签名，
+  // 运行时契约未变——用宽松类型绕开重载匹配（lib 旧代码一直正常运行即证）
+  ctx.on('agent/pre-step', (async (payload: any, next: any) => {
     const decision = await next()
     if (decision.kind !== 'enter') return decision
     const now = new Date()
@@ -40,5 +42,5 @@ export function installLifeInject(ctx: Context): void {
       source: { kind: 'plugin', plugin: 'dsh-life-core' },
     })
     return { ...decision, messages: [...decision.messages, msg] }
-  }, { prepend: true })
+  }) as any, { prepend: true })
 }
