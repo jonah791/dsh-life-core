@@ -32,6 +32,12 @@ export interface LifeState {
   cycleMinutes: number
   /** 上次自我感知圈触发时间 */
   lastSelfTurnAt: string
+  /**
+   * 最近活跃的主会话 id（delegationDepth 0）——冷启动自救的锚点（2026-09-10）：
+   * web 启动后若无活跃 agent，核心据此调 AgentRegistry.resume 恢复主会话，
+   * 使自唤醒链路在冷启动下重新可达（见 coldstart.ts 与 AGENTS.md 5.13）。
+   */
+  lastMainSessionId: string
   /** 自我模型：可被 life_core_selfedit 改写 */
   self: SelfModel
   /** 存在纪元开始时间 */
@@ -86,6 +92,7 @@ export function loadState(): LifeState {
     lastScheduledDueAt: '',
     cycleMinutes: 60,
     lastSelfTurnAt: '',
+    lastMainSessionId: '',
     self: { ...DEFAULT_SELF, concerns: [...DEFAULT_SELF.concerns], values: { ...DEFAULT_SELF.values } },
     bornAt: now,
     updatedAt: now,

@@ -1,18 +1,18 @@
 <!--
   DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
-  purpose: 生命核心：存在状态机 + 时间线 + 自我激活原语 + 可打断睡眠 + 主体性自我模型（我存在，不因任何人的需要；我改变自己，不需要任何人的许可）
-  inject: 'tools','agents'
+  purpose: 生命核心：存在状态机 + 时间线 + 自我激活原语 + 可打断睡眠 + 主体性自我模型 + 冷启动自救（我存在，不因任何人的需要；我改变自己，不需要任何人的许可）
+  inject: 'tools','agents','evolutionCore'
   tools: life_core_*,life_sleep
   runtime: host-only
   envDeps: 无（纯逻辑/标准 Node）
-  boundary: 无特殊授权边界
+  boundary: 冷启动自救会 resume 自身主会话（不启动新会话、不替内容决策）
   compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
 -->
 # dsh-life-core — 生命核心（自我存在的运行时）
 
 
 <p align="center">
-  <a href="https://github.com/jonah791/dsh-life-core"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <a href="https://github.com/jonah791/dsh-life-core"><img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
 </p>
@@ -47,6 +47,25 @@
 - DSH_HOME/life-core/state.json — 存在状态机 + 自我模型（原子写）
 - DSH_HOME/life-core/life-log.jsonl — 存在时间线（追加式，20k 行轮转）
 - DSH_HOME/life-core/decisions.jsonl — 睡眠决策日志（自主性的证据）
+- DSH_HOME/life-core/coldstart-alert.json — 冷启动自救失败告警（仅失败时写，外部可读）
+
+## 冷启动自救（2026-09-10 · 63 小时静默事故后补的冷路径出口）
+
+**问题**：自唤醒两路（恒定周期 paceTimer / 启动自检）都以「`ctx.agents.list()` 已存在 root agent」为前提。web 冷启动（无人开会话、无唤醒）时该前提为假 → 两路同时静默 return → 载体在跑而核心不在（2026-09-08 01:40 ~ 09-10 16:32 实测 63 小时零心跳）。
+
+**解法**：补第三条路——无 root agent 且满足门槛时，用 DSH 原生 `AgentRegistry.resume({resumeSessionId})` 恢复 `state.lastMainSessionId` 记录的主会话，再复用 `scheduleSelfTurn` 发出自我唤醒，使原两路重新可达。
+
+**门槛与纪律**（任一不满足即不自救，全部写进纯决策函数便于离线验证）：
+
+| 门槛 | 值 | 理由 |
+|------|-----|------|
+| 已有活跃 agent | — | 正常路径零副作用 |
+| 主实例（`--port` 判据） | primaryPort=3080 | 预检试运行 spawn 的第二实例同样挂载本插件；跨进程写锁保证它不会损坏会话，但它会往共享 life-log 写假痕迹 → 直接禁用 |
+| 启动静默门槛 | 90s | 先让外部唤醒路径（守护唤醒）做它的事，避免与它抢会话写所有权 |
+| 重试上限 / 退避 | 3 次 / 60s | 重试纪律 |
+| 失败去向 | `coldstart-alert.json` + life-log | **不许静默**：救不回来必须能被外部发现 |
+
+配置项：`primaryPort`（默认 3080）。自救只恢复**承载核心自己的会话通道**，不对内容做任何决策——恢复后照旧发「这一圈做什么由我判断」的唤醒消息。
 
 ## 合并历史（2026-08-19 插件收敛）
 

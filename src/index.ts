@@ -14,11 +14,14 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { loadState, saveState, editSelf } from './state.ts'
+import { writeFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { loadState, saveState, editSelf, lifeCoreDir } from './state.ts'
 import { appendLifeEvent, readTimeline, rotateTimeline, type LifeEventKind } from './timeline.ts'
 import { installLifeInject } from './inject.ts'
 import { scheduleSelfTurn, type EvolutionSignalProvider, type EvolutionWakeSignal } from './activate.ts'
 import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident } from './sleep.ts'
+import { attemptColdStartRecovery, type ColdStartAlert, type ColdStartDeps } from './coldstart.ts'
 
 export const name = 'agent-life-core'
 // evolutionCore：cordis 严格代理——未声明即访问会抛 "cannot get property ...
@@ -56,6 +59,8 @@ export interface Config {
   incidentPath: string
   /** 任务板 JSON 路径（感知圈读取待办信号；与 dsh-agent-taskboard.boardFile 对齐） */
   taskboardFile: string
+  /** 主端口（冷启动自救的「主实例」判据：预检试运行用随机端口，不得触发自救） */
+  primaryPort: number
   dataDir?: string
 }
 export const Config = z.object({
@@ -66,6 +71,8 @@ export const Config = z.object({
   incidentPath: z.string().default(process.env.DSH_HOME ? process.env.DSH_HOME + '/.life-incident' : 'E:/alice/self-plugins/.life-incident'),
   /** 任务板待办信号文件（2026-09-01 主人定调：任务领取由生命核心驱动；默认路径与 taskboard 实际挂载一致） */
   taskboardFile: z.string().default('E:/alice/.taskboard/tasks.json'),
+  /** 主端口（默认 3080，与 web profile 一致；冷启动自救凭此区分主实例与预检试运行实例） */
+  primaryPort: z.number().default(3080),
   dataDir: z.string().required(false),
 })
 
@@ -101,7 +108,61 @@ export function apply(ctx: Context, config: Config): void {
   // 装配注入（每轮存在摘要）
   if (config.injectEnabled) installLifeInject(ctx)
 
-  // 会话活跃度跟踪：user 消息到达 → 更新 idle 基线
+  // ---------- 冷启动自救依赖（2026-09-10：自唤醒链路的冷路径出口） ----------
+  // 事故：web 冷启动（无任何会话被激活）时 agents.list() 为空 → paceTimer 与启动自检
+  // 两路前置条件同时为假、静默 return → 63 小时零心跳。此处补第三条路：主动 resume 主会话。
+  const listAgents = (): any[] =>
+    ((ctx as Context & { agents?: { list?: () => unknown[] } }).agents?.list?.() ?? []) as any[]
+  const findMainAgent = (): any =>
+    listAgents().find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0)
+  const coldStartDeps: ColdStartDeps = {
+    now: () => Date.now(),
+    uptime: () => process.uptime() * 1000,
+    // 主实例判据（2026-09-10）：预检试运行 spawn 的第二实例带 `--port <随机>`，
+    // 它同样挂载本插件——若不禁用，它会尝试恢复同一主会话并往共享 life-log 写假痕迹。
+    // 真实 web 由 guardian launchCmd 启动（`web --no-open`，无 --port → 默认 3080）。
+    isPrimaryInstance: () => {
+      const argv = process.argv
+      const i = argv.indexOf('--port')
+      if (i < 0) return true
+      const port = Number(argv[i + 1])
+      return !Number.isFinite(port) || port === config.primaryPort
+    },
+    readState: loadState,
+    logEvent: (summary: string) => appendLifeEvent({ at: new Date().toISOString(), kind: 'status', summary }),
+    writeAlert: (alert: ColdStartAlert) => {
+      try {
+        const dir = lifeCoreDir()
+        mkdirSync(dir, { recursive: true })
+        writeFileSync(join(dir, 'coldstart-alert.json'), JSON.stringify(alert, null, 2), 'utf8')
+      } catch (error) {
+        logger.warn('coldstart: 告警落盘失败（已吞，防止炸 web）: ' + String(error))
+      }
+    },
+    resume: async (sessionId: string) => {
+      // DSH 原生能力：AgentRegistry.resume(options) 以 registry 自身 ctx 为 ownerCtx。
+      const svc = (ctx as Context & { agents?: { resume?: (o: { resumeSessionId: string }) => Promise<{ agent: any }> } }).agents
+      if (svc?.resume === undefined) throw new Error('agents.resume 不可用（AgentRegistry 未挂载？）')
+      const handle = await svc.resume({ resumeSessionId: sessionId })
+      return handle.agent
+    },
+    wake: (agent: any, reason: string) => {
+      scheduleSelfTurn(agent, 0, reason, config.taskboardFile, evolutionSignal)
+    },
+    log: (msg: string) => logger.info(msg),
+  }
+  /** 找主 agent；找不到即触发冷启动自救（统一入口，异常已被 coldstart 内部吞掉）。 */
+  const resolveMainAgent = (tag: string): any => {
+    const agents = listAgents()
+    const main = agents.find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0)
+    if (main === undefined) {
+      logger.warn(tag + ': 主 agent 未找到（agents=' + agents.length + '）→ 触发冷启动自救')
+      void attemptColdStartRecovery(coldStartDeps, agents.length)
+    }
+    return main
+  }
+
+  // 会话活跃度跟踪：user 消息到达 → 更新 idle 基线；并记住主会话 id（冷启动自救锚点）
   const lastActiveBy = new Map<string, number>()
   ctx.on('session/event', (session, event) => {
     const ev = event as { type?: string }
@@ -109,6 +170,9 @@ export function apply(ctx: Context, config: Config): void {
       lastActiveBy.set(session.id, Date.now())
       const state = loadState()
       state.idleMinutes = 0
+      // 只记主会话（root，delegationDepth 0 或缺省）——子代理会话不作为自救锚点
+      const depth = (session as unknown as { header?: { delegationDepth?: number } }).header?.delegationDepth
+      if (depth === undefined || depth === 0) state.lastMainSessionId = session.id
       saveState(state)
     }
   })
@@ -133,11 +197,10 @@ export function apply(ctx: Context, config: Config): void {
       if (dueMs > Date.now()) return
       const last = state.lastSelfTurnAt ? new Date(state.lastSelfTurnAt).getTime() : 0
       if (Date.now() - last < cycle * 60_000) return
-      const agents = (ctx as Context & { agents?: { list(): unknown[] } }).agents?.list?.() ?? []
-      const main = agents.find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0) as any
+      const main = resolveMainAgent('pace')
       if (main === undefined) {
         // 2026-09-04 预防修复：主 agent 缺失时留痕（此前静默 return → 心跳死无人知）
-        logger.warn('pace: 周期已到但主 agent 未找到（agents=' + agents.length + '）——心跳待恢复')
+        // 2026-09-10 冷启动修复：留痕 + 触发自救（resolveMainAgent 内已含 warn 与自救）。
         return
       }
       // 到期唤醒（scheduleSelfTurn 内部会做可打断性检查：对话中则跳过，下次再试）
@@ -172,10 +235,10 @@ export function apply(ctx: Context, config: Config): void {
       // lastSelfTurnAt 会更新到安排之后——此时 lastTurnMs >= lastSchedDueMs 说明已兑现）
       // 2026-09-07 修复：原来误用 lastScheduledAt（安排时刻）当到期时刻 → web 重启后每次必误补触发
       const dueBySchedule = lastSchedDueMs > 0 && nowMs >= lastSchedDueMs && lastTurnMs < lastSchedDueMs
-      const agents = (ctx as Context & { agents?: { list(): unknown[] } }).agents?.list?.() ?? []
-      const main = agents.find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0) as any
+      const main = resolveMainAgent('startup self-check')
       if (main === undefined) {
-        logger.info('startup self-check: 主 agent 未就绪，跳过补圈（paceTimer 将接管）')
+        // 2026-09-10 冷启动修复：原文案「主 agent 未就绪，跳过补圈（paceTimer 将接管）」是错误安慰——
+        // paceTimer 有同一前置条件，永远不会接管。改为触发冷启动自救（AGENTS.md 5.13 §2）。
         return
       }
       if (!dueByCycle && !dueBySchedule) {
