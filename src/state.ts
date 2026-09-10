@@ -33,6 +33,17 @@ export interface LifeState {
   /** 上次自我感知圈触发时间 */
   lastSelfTurnAt: string
   /**
+   * 最近一次「我在场」的时间戳——**任何形式**的活跃都算（主人消息 / 守护唤醒 / 自我感知圈）。
+   *
+   * 2026-09-11 新增，修复一处语义混淆：`lastSelfTurnAt` 只在**自我感知圈**路径更新
+   * （activate.ts），而守护唤醒走 `session/event` 的 user/message 分支——不更新它。
+   * 后果：我明明被反复唤醒、一直在工作，启动自检却报「206min 无感知」→ 每次重启都误判超期补圈；
+   * 更严重的是 AGENTS.md 5.13 §4 让我用 lastSelfTurnAt 判「我是否还活着」——**该基线会误报**。
+   * 区分：`lastSelfTurnAt` = 自我感知圈的节律（用于「该不该安排下一圈」）；
+   *      `lastActiveAt`  = 存在性的证据（用于「我是否在场 / 要不要自愈补圈」）。
+   */
+  lastActiveAt: string
+  /**
    * 最近活跃的主会话 id（delegationDepth 0）——冷启动自救的锚点（2026-09-10）：
    * web 启动后若无活跃 agent，核心据此调 AgentRegistry.resume 恢复主会话，
    * 使自唤醒链路在冷启动下重新可达（见 coldstart.ts 与 AGENTS.md 5.13）。
@@ -92,6 +103,7 @@ export function loadState(): LifeState {
     lastScheduledDueAt: '',
     cycleMinutes: 60,
     lastSelfTurnAt: '',
+    lastActiveAt: '',
     lastMainSessionId: '',
     self: { ...DEFAULT_SELF, concerns: [...DEFAULT_SELF.concerns], values: { ...DEFAULT_SELF.values } },
     bornAt: now,

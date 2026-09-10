@@ -170,6 +170,10 @@ export function apply(ctx: Context, config: Config): void {
       lastActiveBy.set(session.id, Date.now())
       const state = loadState()
       state.idleMinutes = 0
+      // 2026-09-11 修复：任何 user/message（含**守护唤醒**注入的「web 已拉起」/「web 已重启」）
+      // 都是我「在场」的证据——必须刷新 lastActiveAt。否则启动自检只认自我感知圈，
+      // 会在我明明被反复唤醒、一直在工作的情况下误判「N 分钟无感知」并多余补圈。
+      state.lastActiveAt = new Date().toISOString()
       // 只记主会话（root，delegationDepth 0 或缺省）——子代理会话不作为自救锚点
       const depth = (session as unknown as { header?: { delegationDepth?: number } }).header?.delegationDepth
       if (depth === undefined || depth === 0) state.lastMainSessionId = session.id
@@ -228,9 +232,15 @@ export function apply(ctx: Context, config: Config): void {
       const cycle = state.cycleMinutes
       const nowMs = Date.now()
       const lastTurnMs = state.lastSelfTurnAt ? new Date(state.lastSelfTurnAt).getTime() : 0
+      // 2026-09-11 修复：A 路判据由 lastSelfTurnAt 改为 lastActiveAt。
+      // A 路问的是「我最近在场吗」（重启后要不要自愈补圈）——任何形式的活跃都算在场
+      // （主人消息 / 守护唤醒 / 自我感知圈）。旧判据只认自我感知圈 → 守护唤醒后仍报
+      // 「206min 无感知」→ 每次重启都误判超期补圈（实测：每 30 分钟心跳重启即触发一次）。
+      // B 路（安排是否兑现）继续用 lastSelfTurnAt：它问的是「自我感知圈有没有真发生」，语义不同。
+      const lastActiveMs = state.lastActiveAt ? new Date(state.lastActiveAt).getTime() : lastTurnMs
       const lastSchedDueMs = state.lastScheduledDueAt ? new Date(state.lastScheduledDueAt).getTime() : 0
-      // A 路：周期到期
-      const dueByCycle = cycle > 0 && nowMs - lastTurnMs >= cycle * 60_000
+      // A 路：周期到期（以「最近在场」为准）
+      const dueByCycle = cycle > 0 && nowMs - lastActiveMs >= cycle * 60_000
       // B 路：手动安排到期但未兑现（scheduleSelfTurn 写 lastScheduledDueAt=到期时刻；若之后有自我感知，
       // lastSelfTurnAt 会更新到安排之后——此时 lastTurnMs >= lastSchedDueMs 说明已兑现）
       // 2026-09-07 修复：原来误用 lastScheduledAt（安排时刻）当到期时刻 → web 重启后每次必误补触发
@@ -242,15 +252,20 @@ export function apply(ctx: Context, config: Config): void {
         return
       }
       if (!dueByCycle && !dueBySchedule) {
-        logger.info('startup self-check: 无需补圈（距上次感知 ' + Math.round((nowMs - lastTurnMs) / 60000) + 'min < 周期 ' + cycle + 'min，安排未到期或已兑现）')
+        logger.info('startup self-check: 无需补圈（距上次在场 ' + Math.round((nowMs - lastActiveMs) / 60000) + 'min < 周期 ' + cycle + 'min，安排未到期或已兑现）')
         return
       }
       const reason = dueBySchedule
-        ? '启动自检：有安排未兑现（lastScheduledAt 已过但无感知——timer 被重启吞掉），补触发'
-        : '启动自检：距上次感知已超 ' + cycle + ' 分钟周期（重启后心跳自愈），补触发'
+        ? '启动自检：有安排未兑现（已到期待兑现但无自我感知——timer 被重启吞掉），补触发'
+        : '启动自检：距上次在场已超 ' + cycle + ' 分钟周期（重启后心跳自愈），补触发'
       // 补圈
       scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal)
-      appendLifeEvent({ at: new Date().toISOString(), kind: 'self-turn', summary: reason + '（' + Math.round((nowMs - lastTurnMs) / 60000) + 'min 无感知）', ref: main?.id })
+      appendLifeEvent({
+        at: new Date().toISOString(), kind: 'self-turn',
+        summary: reason + '（实为 ' + Math.round((nowMs - lastActiveMs) / 60000) + 'min 未在场；上次自我感知圈 '
+          + Math.round((nowMs - lastTurnMs) / 60000) + 'min 前）',
+        ref: main?.id,
+      })
       logger.info('startup self-check: 补圈已触发（' + reason + '）')
     } catch (error) {
       logger.warn('startup self-check 异常: ' + String(error))

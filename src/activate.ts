@@ -164,6 +164,8 @@ export function scheduleSelfTurn(
         appendLifeEvent({ at, kind: 'self-turn', summary: '自我感知圈触发：' + reason + '（自我唤醒已发出' + (evolutionSignal !== undefined ? '，联动进化核心' : '') + '）', ref: sid })
         const st2 = loadState()
         st2.lastSelfTurnAt = at
+        // 自我感知圈也是「我在场」的一种形式——同步刷新存在性证据（2026-09-11）
+        st2.lastActiveAt = at
         saveState(st2)
       })
     } catch (error) {
