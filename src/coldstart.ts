@@ -147,6 +147,21 @@ export const COLDSTART_RETRY_BACKOFF_MS = 60_000
  */
 export const COLDSTART_MIN_SILENCE_MS = 90_000
 
+/**
+ * 冷启动探测间隔（ms）——独立于 paceTimer 的感知周期闸门。
+ *
+ * 2026-09-11 修复（t-13d309f3 验证时读代码发现的**防线时间学缺陷**，不是"没测过"）：
+ * coldstart 的唯一入口 resolveMainAgent 位于 paceTimer 的感知周期检查之后
+ * （`if (Date.now() - last < cycle * 60_000) return` 早于它），而启动自检只在启动 30s
+ * 跑一次（彼时静默门槛 90s 未过 → 恒 none）。最坏情况：冷启动发生在感知圈后不久 →
+ * 自救要等 lastSelfTurnAt + cycle（最长 180min）才触发，静默窗口达 2.7 小时。
+ *
+ * 正确性条件（由 tests/coldstart.test.mjs 断言守卫）：
+ *   COLDSTART_PROBE_INTERVAL_MS <= COLDSTART_MIN_SILENCE_MS
+ * 否则静默门槛过后可能长时间无人探测，重演同一个窗口。
+ */
+export const COLDSTART_PROBE_INTERVAL_MS = 30_000
+
 interface ColdStartRuntime {
   attempts: number
   lastAttemptAtMs: number

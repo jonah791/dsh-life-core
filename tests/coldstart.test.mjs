@@ -15,6 +15,7 @@ import {
   COLDSTART_MAX_ATTEMPTS,
   COLDSTART_RETRY_BACKOFF_MS,
   COLDSTART_MIN_SILENCE_MS,
+  COLDSTART_PROBE_INTERVAL_MS,
 } from '../lib/coldstart.js'
 
 /** 构造判定输入（缺省 = 冷启动现场：无 agent、会话 id 已知、主实例、已过静默门槛、从未尝试）。 */
@@ -185,4 +186,41 @@ test('attempt: 判定异常被吞并留痕（绝不冒泡炸掉 paceTimer → we
   const kind = await attemptColdStartRecovery(d, 0)
   assert.equal(kind, 'none')
   assert.ok(d.calls.logs.some((m) => /判定异常/.test(m)))
+})
+
+// ---------- 2026-09-11：静默窗口缺口（t-13d309f3 验证时读代码发现） ----------
+
+test('接线守卫: 探测间隔 ≤ 静默门槛（否则门槛过后可能长时间无人探测，重演同一窗口）', () => {
+  assert.ok(
+    COLDSTART_PROBE_INTERVAL_MS <= COLDSTART_MIN_SILENCE_MS,
+    'COLDSTART_PROBE_INTERVAL_MS(' + COLDSTART_PROBE_INTERVAL_MS
+      + ') 必须 ≤ COLDSTART_MIN_SILENCE_MS(' + COLDSTART_MIN_SILENCE_MS + ')',
+  )
+})
+
+test('回归（2026-09-11 静默窗口）: 静默门槛一过即可自救，不必等感知周期到期', async () => {
+  resetColdStartState()
+  // 模拟 index.ts 的独立探测节奏（每 COLDSTART_PROBE_INTERVAL_MS 一次）
+  let upMs = COLDSTART_PROBE_INTERVAL_MS
+  const d = deps({ uptime: () => upMs })
+  // 首次探测（30s）：门槛未过 → none，且不得误报 alert
+  assert.equal(await attemptColdStartRecovery(d, 0), 'none')
+  assert.equal(d.calls.resumes.length, 0)
+  assert.equal(d.calls.alerts.length, 0)
+  // 按探测节奏推进
+  let kind = 'none'
+  let probes = 1
+  while (upMs <= COLDSTART_MIN_SILENCE_MS + COLDSTART_PROBE_INTERVAL_MS && probes < 10) {
+    upMs += COLDSTART_PROBE_INTERVAL_MS
+    probes += 1
+    kind = await attemptColdStartRecovery(d, 0)
+    if (kind === 'resume') break
+  }
+  assert.equal(kind, 'resume', '门槛过后必须能自救（修复前要等 lastSelfTurnAt+cycle，最长静默 2.7 小时）')
+  assert.equal(d.calls.resumes.length, 1)
+  assert.equal(d.calls.resumes[0], 'session-main-1')
+  assert.ok(
+    probes <= Math.ceil(COLDSTART_MIN_SILENCE_MS / COLDSTART_PROBE_INTERVAL_MS) + 1,
+    '应在门槛过后第一次探测即自救（实际 probes=' + probes + '）',
+  )
 })

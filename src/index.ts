@@ -21,7 +21,7 @@ import { appendLifeEvent, readTimeline, rotateTimeline, type LifeEventKind } fro
 import { installLifeInject } from './inject.ts'
 import { scheduleSelfTurn, type EvolutionSignalProvider, type EvolutionWakeSignal } from './activate.ts'
 import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident } from './sleep.ts'
-import { attemptColdStartRecovery, type ColdStartAlert, type ColdStartDeps } from './coldstart.ts'
+import { attemptColdStartRecovery, COLDSTART_PROBE_INTERVAL_MS, type ColdStartAlert, type ColdStartDeps } from './coldstart.ts'
 
 export const name = 'agent-life-core'
 // evolutionCore：cordis 严格代理——未声明即访问会抛 "cannot get property ...
@@ -214,9 +214,32 @@ export function apply(ctx: Context, config: Config): void {
       logger.warn('pace: 感知圈检查异常（已吞，防止炸 web）: ' + String(e))
     }
   }, 5 * 60_000)
+
+  // ---------- 冷启动探测（2026-09-11 修复：闭合「感知周期闸门」造成的静默窗口） ----------
+  // 缺口（t-13d309f3 验证时读代码发现——不是"防线没测过"，而是防线本身有时间学缺陷）：
+  //   coldstart 的唯一入口 resolveMainAgent 位于 paceTimer 的**感知周期检查之后**：
+  //     `if (Date.now() - last < cycle * 60_000) return`   ← 早于它
+  //     const main = resolveMainAgent('pace')              ← 入口在这之后
+  //   而启动自检只在启动 30s 跑一次，彼时 coldstart 静默门槛（90s）未过 → 恒返回 none。
+  //   推演最坏情况：冷启动恰好发生在感知圈后不久 → 每 5 分钟 tick 都因周期未到 return
+  //   → 自救要等 lastSelfTurnAt + cycle（最长 180min）才触发，静默窗口达 2.7 小时。
+  // 修复：独立探测（COLDSTART_PROBE_INTERVAL_MS=30s ≤ 静默门槛 90s），门槛一过即尝试自救。
+  //   重试/退避/告警全由 attemptColdStartRecovery 内部统一处理（inFlight 互斥 ⇒ 与
+  //   paceTimer 的调用互不干扰，重复调用无副作用）。
+  const coldStartProbeTimer = setInterval(() => {
+    try {
+      // 有在场 agent → 静默跳过（不调用，避免每 30s 刷一条 none 日志）
+      if (listAgents().length > 0) return
+      void attemptColdStartRecovery(coldStartDeps, 0)
+    } catch (error) {
+      logger.warn('coldstart probe 异常（已吞，防止炸 web）: ' + String(error))
+    }
+  }, COLDSTART_PROBE_INTERVAL_MS)
+
   ctx.effect(() => () => {
     clearInterval(rotateTimer)
     clearInterval(paceTimer)
+    clearInterval(coldStartProbeTimer)
   })
 
   // ---------- 启动自检（2026-09-04 预防修复：重启后心脏自动恢复跳动） ----------
