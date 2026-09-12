@@ -14,6 +14,49 @@ import { readFileSync } from 'node:fs'
 import { loadState, saveState } from './state.ts'
 import { appendLifeEvent } from './timeline.ts'
 import { SELF_TURN_MARK } from './inject.ts'
+import { decidePaceSkip, PACE_HEALTHY } from './pace.ts'
+
+/**
+ * 跳过一支自我感知圈：退避 + 停摆告警（2026-09-12 修复）。
+ *
+ * 旧实现（本文件 3 处跳过分支 = `appendLifeEvent` + `return`）只把「本圈跳过」写进时间线，
+ * 由 `scheduleSelfTurn` 把 `lastScheduledDueAt` 置为**现在**，却从不推进 `lastSelfTurnAt`——
+ * 而 paceTimer 的两道闸门（due 未到 / 周期未到）恰恰只看这两个字段，于是每一次跳过都把
+ * 机制推回「立刻到期」：09-11 跳过 156 次、09-12 跳过 155 次，期间 29 小时零真实感知圈，
+ * 时间线却显示「每 5 分钟都在安排」（静默失败被日志掩盖，AGENTS.md 5.10 §3）。
+ *
+ * 现在：跳过 → 指数退避（下次尝试推远，封顶一个周期）→ 真实缺席且连续跳过达阈值时响亮告警。
+ * @param at - 本次跳过时刻（ISO）
+ * @param sid - 会话 id（时间线留痕用）
+ * @param reason - 跳过原因（写入事件与告警）
+ */
+function notePaceSkip(at: string, sid: string, reason: string): void {
+  const state = loadState()
+  const decision = decidePaceSkip({
+    nowMs: Date.parse(at),
+    cycleMinutes: state.cycleMinutes,
+    previousSkipStreak: state.paceSkipStreak ?? 0,
+    lastActiveAt: state.lastActiveAt ?? '',
+    reason,
+  })
+  state.paceSkipStreak = decision.skipStreak
+  state.paceLastSkipReason = reason
+  state.lastScheduledAt = at
+  state.lastScheduledDueAt = new Date(decision.nextAttemptAtMs).toISOString()
+  if (decision.stalled && (state.paceStalledAt ?? '').length === 0) {
+    state.paceStalledAt = at
+    appendLifeEvent({ at, kind: 'status', summary: decision.alarm, ref: sid })
+  }
+  saveState(state)
+  appendLifeEvent({
+    at,
+    kind: 'self-turn',
+    summary: '自我感知圈到期：' + reason + '，本圈跳过（连续 ' + decision.skipStreak
+      + ' 次，退避 ' + decision.backoffMinutes + ' 分钟后重试，下次 '
+      + new Date(decision.nextAttemptAtMs).toISOString() + '）',
+    ref: sid,
+  })
+}
 
 export interface SelfPlan {
   sessionId: string
@@ -97,20 +140,26 @@ export function scheduleSelfTurn(
     timers.delete(sid)
     planned.delete(sid)
     const at = new Date().toISOString()
+    const stateBefore = loadState()
+    // 停摆自愈（2026-09-12）：停摆 = 真实缺席 + 连续跳过达阈值。此时「队列里有消息」已不足以
+    // 证明我被叫醒（队列恰恰可能根本没被消费）——以存在性证据为准，越过队列闸门强发一次唤醒；
+    // 队列消息若被消费，本次唤醒自然解除停摆；若无人消费，则告警继续留在时间线上（响亮）。
+    const stalled = (stateBefore.paceStalledAt ?? '').length > 0
     // 可打断性：主人消息已在队列，或期间已有用户输入事件 → 已被叫醒（每圈必留痕）
-    if (agent.inbox?.hasPending === true) {
-      appendLifeEvent({ at, kind: 'self-turn', summary: '自我感知圈到期：主人消息已在队列（已被叫醒），本圈跳过', ref: sid })
+    // 宿主 0.1.5 公共 Inbox 接口未声明 hasPending（运行期有、类型无）——用公共 nextTurn/nextStep 等价判断
+    if (!stalled && (agent.inbox?.nextTurn.length ?? 0) + (agent.inbox?.nextStep.length ?? 0) > 0) {
+      notePaceSkip(at, sid, '主人消息已在队列（已被叫醒）')
       return
     }
     // 防御：agent.session 可能已 detach（agent 存活但 session 释放）——与上方 startSeq 同款保护。
     // 2026-09-06 实测：此处 events 为 undefined 时 wasInterrupted 内 .length 抛 TypeError → 未捕获 → 整 web 退出。
     // alpha.4 适配：Session.events 已移除，session 存在与否本身即防御点（seq 恒在）。
     if (agent.session === undefined) {
-      appendLifeEvent({ at, kind: 'self-turn', summary: '自我感知圈到期：session 已释放，本圈跳过', ref: sid })
+      notePaceSkip(at, sid, 'session 已释放')
       return
     }
     if (wasInterrupted(agent.session as unknown as { seq: number; eventAt(seq: number): unknown | undefined }, startSeq)) {
-      appendLifeEvent({ at, kind: 'self-turn', summary: '自我感知圈到期：期间已有主人交互（已醒），本圈跳过——下一圈再续', ref: sid })
+      notePaceSkip(at, sid, '期间已有主人交互（已醒）——下一圈再续')
       return
     }
 
@@ -166,6 +215,10 @@ export function scheduleSelfTurn(
         st2.lastSelfTurnAt = at
         // 自我感知圈也是「我在场」的一种形式——同步刷新存在性证据（2026-09-11）
         st2.lastActiveAt = at
+        // 真触发即是「机制在用」的证据：连续跳过计数与停摆标记归零（2026-09-12）
+        st2.paceSkipStreak = PACE_HEALTHY.paceSkipStreak
+        st2.paceStalledAt = PACE_HEALTHY.paceStalledAt
+        st2.paceLastSkipReason = PACE_HEALTHY.paceLastSkipReason
         saveState(st2)
       })
     } catch (error) {

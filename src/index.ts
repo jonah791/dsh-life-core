@@ -322,7 +322,11 @@ export function apply(ctx: Context, config: Config): void {
           incident: { oneOf: [{ type: 'string' }, { type: 'null' }] },
         },
       },
-      render: (_a: unknown, v: any) => [{ type: 'text', text: '存在状态：' + (v.state?.status ?? '?') + ' · 今日 ' + (v.state?.todayTurns ?? 0) + ' 圈 · 宣言：' + String(v.state?.self?.creed ?? '').slice(0, 40) }],
+      render: (_a: unknown, v: any) => [{
+        type: 'text',
+        text: (v.state?.paceStalledAt ? '⚠ 感知圈停摆（自 ' + String(v.state.paceStalledAt).slice(11, 16) + '，连续跳过 ' + (v.state?.paceSkipStreak ?? 0) + ' 次）· ' : '')
+          + '存在状态：' + (v.state?.status ?? '?') + ' · 今日 ' + (v.state?.todayTurns ?? 0) + ' 圈 · 宣言：' + String(v.state?.self?.creed ?? '').slice(0, 40),
+      }],
     },
     async execute(args: { includeTimeline?: boolean }, exec: any) {
       const state = loadState()

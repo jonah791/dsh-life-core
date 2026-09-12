@@ -63,7 +63,8 @@ export function scheduleSleep(agent: Agent, minutes: number, reason: string, inc
     // 防御：session 释放时跳过本圈唤醒（不崩 web）
     if (agent.session === undefined) return
     // 可打断性：主人消息已在队列，或期间已有用户输入事件 → 已被叫醒，不再自我唤醒
-    if (agent.inbox?.hasPending === true) return
+    // 宿主 0.1.5 公共 Inbox 接口未声明 hasPending（运行期有、类型无）——用公共 nextTurn/nextStep 等价判断
+    if ((agent.inbox?.nextTurn.length ?? 0) + (agent.inbox?.nextStep.length ?? 0) > 0) return
     if (wasInterrupted(agent.session as unknown as { seq: number; eventAt(seq: number): unknown | undefined }, startSeq)) return
     const elapsedMin = Math.max(1, Math.round((Date.now() - startedAt) / 60000))
     const newEvents = agent.session.seq - startSeq

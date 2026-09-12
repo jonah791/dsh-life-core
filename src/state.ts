@@ -33,6 +33,17 @@ export interface LifeState {
   /** 上次自我感知圈触发时间 */
   lastSelfTurnAt: string
   /**
+   * 连续跳过自我感知圈的次数（0 = 健康，成功触发时归零）。
+   *
+   * 2026-09-12 新增：旧实现跳过时不记录任何计数，于是「跳过」既不留强度信号、
+   * 也不触发升级——两天 311 次跳过零告警。计数是停摆告警的前置条件。
+   */
+  paceSkipStreak: number
+  /** 感知圈停摆告警起始时刻（空串 = 未停摆）；提示唤醒链路可能已被锁死 */
+  paceStalledAt: string
+  /** 最近一次跳过的原因（供停摆告警与事后诊断引用） */
+  paceLastSkipReason: string
+  /**
    * 最近一次「我在场」的时间戳——**任何形式**的活跃都算（主人消息 / 守护唤醒 / 自我感知圈）。
    *
    * 2026-09-11 新增，修复一处语义混淆：`lastSelfTurnAt` 只在**自我感知圈**路径更新
@@ -104,6 +115,9 @@ export function loadState(): LifeState {
     cycleMinutes: 60,
     lastSelfTurnAt: '',
     lastActiveAt: '',
+    paceSkipStreak: 0,
+    paceStalledAt: '',
+    paceLastSkipReason: '',
     lastMainSessionId: '',
     self: { ...DEFAULT_SELF, concerns: [...DEFAULT_SELF.concerns], values: { ...DEFAULT_SELF.values } },
     bornAt: now,
