@@ -20,6 +20,8 @@ import { loadState, saveState, editSelf, lifeCoreDir } from './state.ts'
 import { appendLifeEvent, readTimeline, rotateTimeline, type LifeEventKind } from './timeline.ts'
 import { installLifeInject } from './inject.ts'
 import { scheduleSelfTurn, type EvolutionSignalProvider, type EvolutionWakeSignal } from './activate.ts'
+// 圈投递目标选举（2026-09-13 主人：「感知圈怎么发到别的会话了」）——见 src/target.ts 头部事故注释
+import { electCircleTarget } from './target.ts'
 import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident } from './sleep.ts'
 import { attemptColdStartRecovery, COLDSTART_PROBE_INTERVAL_MS, type ColdStartAlert, type ColdStartDeps } from './coldstart.ts'
 
@@ -113,8 +115,55 @@ export function apply(ctx: Context, config: Config): void {
   // 两路前置条件同时为假、静默 return → 63 小时零心跳。此处补第三条路：主动 resume 主会话。
   const listAgents = (): any[] =>
     ((ctx as Context & { agents?: { list?: () => unknown[] } }).agents?.list?.() ?? []) as any[]
-  const findMainAgent = (): any =>
-    listAgents().find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0)
+  /**
+   * 找主 agent 的**唯一入口**——圈只投给「我在的那个会话」。
+   *
+   * 2026-09-13 修复（主人：「感知圈怎么发到别的会话了」）：原实现 `agents.find(delegationDepth ?? 0 === 0)`
+   * 取列表第一个 root agent，且 `delegationDepth` 缺失时兜底为 0 ⇒ **裸 uuid 子代理会话被判成 root**、
+   * 圈被投进子代理与其他会话（取证：3 个裸 uuid 会话各收到 17 圈）。现在统一走 §5.18 判据：
+   * ① 只认 `session-*` 用户会话（裸 uuid = 派生会话，永不投递）；② 锚点仍在则优先；③ 否则最近活跃用户会话；
+   * ④ 每次选举留证据行（目标 + 理由 + 候选数 + 排除的派生会话数）。
+   */
+  const resolveMainAgent = (tag: string): any => {
+    const agents = listAgents()
+    const state = loadState()
+    const idOf = (a: any): string => String(a?.id ?? a?.session?.id ?? '')
+    const candidates = agents.map((a: any) => ({
+      id: idOf(a),
+      lastActiveAt: lastActiveBy.get(idOf(a)) ?? 0,
+    }))
+    const elected = electCircleTarget(candidates, {
+      pinned: state.lastMainSessionId ?? '',
+      now: Date.now(),
+    })
+    if (elected === null) {
+      logger.warn(tag + ': 无可用用户会话（agents=' + agents.length + '，候选全是派生会话或无候选）→ 触发冷启动自救')
+      void attemptColdStartRecovery(coldStartDeps, agents.length)
+      return undefined
+    }
+    const main = agents.find((a: any) => idOf(a) === elected.targetId)
+    if (main === undefined) {
+      logger.warn(tag + ': 选举目标不在列表（目标=' + elected.targetId + '，agents=' + agents.length + '）→ 触发冷启动自救')
+      void attemptColdStartRecovery(coldStartDeps, agents.length)
+      return undefined
+    }
+    logger.info(tag + ': 圈投递目标=' + elected.targetId + '（' + elected.reason
+      + '；候选=' + candidates.length + '，排除派生=' + elected.excludedDerived + '）')
+    return main
+  }
+  /** 冷启动前置判据：只要**存在用户会话**就不必自救（子代理会话不算在场）。 */
+  const findMainAgent = (): any => {
+    const agents = listAgents()
+    const elected = electCircleTarget(
+      agents.map((a: any) => ({
+        id: String(a?.id ?? a?.session?.id ?? ''),
+        lastActiveAt: lastActiveBy.get(String(a?.id ?? a?.session?.id ?? '')) ?? 0,
+      })),
+      { pinned: loadState().lastMainSessionId ?? '', now: Date.now() },
+    )
+    if (elected === null) return undefined
+    return agents.find((a: any) => String(a?.id ?? a?.session?.id ?? '') === elected.targetId)
+  }
   const coldStartDeps: ColdStartDeps = {
     now: () => Date.now(),
     uptime: () => process.uptime() * 1000,
@@ -151,16 +200,9 @@ export function apply(ctx: Context, config: Config): void {
     },
     log: (msg: string) => logger.info(msg),
   }
-  /** 找主 agent；找不到即触发冷启动自救（统一入口，异常已被 coldstart 内部吞掉）。 */
-  const resolveMainAgent = (tag: string): any => {
-    const agents = listAgents()
-    const main = agents.find((a: any) => (a?.session?.header?.delegationDepth ?? 0) === 0)
-    if (main === undefined) {
-      logger.warn(tag + ': 主 agent 未找到（agents=' + agents.length + '）→ 触发冷启动自救')
-      void attemptColdStartRecovery(coldStartDeps, agents.length)
-    }
-    return main
-  }
+  // resolveMainAgent 已上移并与 findMainAgent 统一为「圈投递目标选举」（见上方 resolveMainAgent 注释）。
+  // 旧实现（agents.find(delegationDepth ?? 0 === 0) 取列表第一个 root）于 2026-09-13 删除——
+  // 它是「圈发到别的会话」的根因：delegationDepth 缺失时兜底 0 使子代理会话被判成 root。
 
   // 会话活跃度跟踪：user 消息到达 → 更新 idle 基线；并记住主会话 id（冷启动自救锚点）
   const lastActiveBy = new Map<string, number>()
