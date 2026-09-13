@@ -149,6 +149,15 @@ export function apply(ctx: Context, config: Config): void {
     }
     logger.info(tag + ': 圈投递目标=' + elected.targetId + '（' + elected.reason
       + '；候选=' + candidates.length + '，排除派生=' + elected.excludedDerived + '）')
+    // 落盘证据（2026-09-13 修）：web 进程 stdout **没有落点**（实测 `.dsh/*.log` 全无 'pace:' 行，
+    // 而 pace 路径必然打过日志）——logger 写的证据行等于写进虚空。圈投递目标必须落在**可被读到**
+    // 的地方，故同时写 life-log（§5.12「提醒类机制要有存活证据」的落地形态）。
+    appendLifeEvent({
+      at: new Date().toISOString(),
+      kind: 'status',
+      summary: tag + ' 圈投递目标=' + elected.targetId + '（' + elected.reason
+        + '；候选=' + candidates.length + '，排除派生=' + elected.excludedDerived + '）',
+    })
     return main
   }
   /** 冷启动前置判据：只要**存在用户会话**就不必自救（子代理会话不算在场）。 */
