@@ -96,8 +96,20 @@ function stateFile(): string {
   return join(lifeCoreDir(), 'state.json')
 }
 
-function today(): string {
-  return new Date().toISOString().slice(0, 10)
+/**
+ * 本地自然日的日期键（`YYYY-MM-DD`）。
+ *
+ * ⚠ 2026-09-22 修正：原实现 `new Date().toISOString().slice(0, 10)` 取的是 **UTC 日历日**，
+ * 而本机是 UTC+8 ⇒ 本地 08:00 一到 UTC 就跨天，`todayTurns` 被腰斩（00:00–08:00 的圈记进"昨天"）。
+ * 更糟的是同一份状态行里 `inject.ts` 的小时用的是**本地** `getHours()` ⇒ 一行读数混着两个时区。
+ * 语义意图（见 loadState 的「自然日滚动」）本就是**本地自然日**，故此处必须取本地日期。
+ * 判据：源码级契约测试断言本函数不得出现 `toISOString`。
+ * @returns 形如 `2026-09-22`
+ */
+export function today(): string {
+  const d = new Date()
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`
 }
 
 export function loadState(): LifeState {
