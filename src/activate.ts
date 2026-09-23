@@ -16,6 +16,12 @@ import { appendLifeEvent } from './timeline.ts'
 import { SELF_TURN_MARK } from './inject.ts'
 import { decidePaceSkip, PACE_HEALTHY } from './pace.ts'
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-life-core': { kind: 'dsh-life-core' }
+  }
+}
+
 /**
  * 跳过一支自我感知圈：退避 + 停摆告警（2026-09-12 修复）。
  *
@@ -205,7 +211,7 @@ export function scheduleSelfTurn(
         agent.send(
           createUserMessage({
             content: [{ type: 'text', text: body }],
-            source: { kind: 'plugin', plugin: 'dsh-life-core' },
+            source: { kind: 'dsh-life-core' },
           }),
           'next-turn',
           true,
@@ -268,9 +274,8 @@ export function wasInterrupted(
     if (ev?.type !== 'user/message') continue
     const src = ev.data?.source
     const kind = src?.kind
-    const plugin = src?.plugin
     if (kind === 'user') return true
-    if (kind === 'plugin' && plugin === 'dsh-agent-telegram') return true
+    if (kind === 'dsh-agent-telegram') return true
     // plugin 注入（life-core 自我感知 / life 时间 / memory 速览）不算用户交互
   }
   return false

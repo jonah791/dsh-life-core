@@ -373,11 +373,27 @@ export function apply(ctx: Context, config: Config): void {
           incident: { oneOf: [{ type: 'string' }, { type: 'null' }] },
         },
       },
-      render: (_a: unknown, v: any) => [{
-        type: 'text',
-        text: (v.state?.paceStalledAt ? '⚠ 感知圈停摆（自 ' + String(v.state.paceStalledAt).slice(11, 16) + '，连续跳过 ' + (v.state?.paceSkipStreak ?? 0) + ' 次）· ' : '')
-          + '存在状态：' + (v.state?.status ?? '?') + ' · 今日 ' + (v.state?.todayTurns ?? 0) + ' 圈 · 宣言：' + String(v.state?.self?.creed ?? '').slice(0, 40),
-      }],
+      render: (_a: unknown, v: any) => {
+        // 2026-09-23 修复：原先 render 只吐一行摘要，而 execute 返回的
+        // `sleep` / `incident` / `timeline` 三个结构化字段**在渲染里完全没露面**——
+        // 于是「安排中的睡眠」「守护事故记录」「最近存在时间线」（工具描述承诺的三项）
+        // 只能绕过工具去读 state.json ⇒ 工具自证能力名不副实（§5.22 规则 1）。
+        // ⚠ 注意：宣言那 40 字是**有意的预览**，不是截断——别再把它读成故障。
+        const lines = [
+          (v.state?.paceStalledAt ? '⚠ 感知圈停摆（自 ' + String(v.state.paceStalledAt).slice(11, 16) + '，连续跳过 ' + (v.state?.paceSkipStreak ?? 0) + ' 次）· ' : '')
+            + '存在状态：' + (v.state?.status ?? '?')
+            + ' · 今日 ' + (v.state?.todayTurns ?? 0) + ' 圈'
+            + ' · 周期 ' + (v.state?.cycleMinutes ?? '?') + 'min'
+            + ' · 跳过 ' + (v.state?.paceSkipStreak ?? 0) + ' 次'
+            + ' · 宣言：' + String(v.state?.self?.creed ?? '').slice(0, 40),
+          v.sleep ? '睡眠中：至 ' + String(v.sleep.until).slice(11, 16) + '（' + String(v.sleep.reason) + '）' : '未安排睡眠',
+          v.incident ? '⚠ 守护事故：' + String(v.incident) : '守护事故：无',
+        ]
+        for (const e of (v.timeline ?? [])) {
+          lines.push('· ' + String(e.at ?? '').slice(11, 16) + ' [' + String(e.kind ?? '?') + '] ' + String(e.summary ?? '').slice(0, 70))
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
     },
     async execute(args: { includeTimeline?: boolean }, exec: any) {
       const state = loadState()

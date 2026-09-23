@@ -11,6 +11,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import { loadState, recordTurn } from './state.ts'
 import { isUserSession } from './target.ts'
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-life-core': { kind: 'dsh-life-core' }
+  }
+}
+
 export const SELF_TURN_MARK = '[life-core] 自我感知'
 
 export function isSelfTurn(text: string): boolean {
@@ -63,7 +69,7 @@ export function installLifeInject(ctx: Context): void {
 
     const msg = createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-life-core' },
+      source: { kind: 'dsh-life-core' },
     })
     return { ...decision, messages: [...decision.messages, msg] }
   }) as any, { prepend: true })

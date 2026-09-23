@@ -17,6 +17,12 @@ import { lifeCoreDir } from './state.ts'
 import { appendLifeEvent } from './timeline.ts'
 import { pendingTaskSignal, wasInterrupted } from './activate.ts'
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-life-core': { kind: 'dsh-life-core' }
+  }
+}
+
 /** 单次睡眠上限（7 天，防手误）；agent 决策理应远小于此。 */
 export const MAX_SLEEP_MINUTES = 7 * 24 * 60
 
@@ -73,7 +79,7 @@ export function scheduleSleep(agent: Agent, minutes: number, reason: string, inc
       agent.send(
         createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: 'dsh-life-core' },
+          source: { kind: 'dsh-life-core' },
         }),
         'next-turn',
         true,
