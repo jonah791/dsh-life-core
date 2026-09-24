@@ -124,7 +124,7 @@
 | 跳过退避 + 停摆告警（纯函数） | `src/pace.ts`（`decidePaceSkip` / `absentMinutes` / `PACE_STALL_AFTER_SKIPS`） |
 | 冷启动自救（纯决策 + 重试状态机） | `src/coldstart.ts`（`decideColdStart` / `attemptColdStartRecovery`） |
 | 可打断睡眠 | `src/sleep.ts`（`scheduleSleep` / `MAX_SLEEP_MINUTES=10080`） |
-| 存在时间线 | `src/timeline.ts`（`appendLifeEvent` / `rotateTimeline`） |
+| 存在时间线 | `src/timeline.ts`（`appendLifeEvent` / `readTimeline`（上界契约，缺省最近 50）/ `rotateTimeline`） |
 | 每轮注入 + 感知圈标记 | `src/inject.ts`（`SELF_TURN_MARK` / `isSelfTurn`） |
 | 工具注册 + 配置 | `src/index.ts`（6 工具 + `Config`） |
 
@@ -137,7 +137,7 @@
 | 2026-09-10 | **冷启动自救**（v0.2.0，`39c074a`） | 63 小时静默事故：web 活着但零会话被激活 → 自唤醒链路整体不可达 |
 | 2026-09-11 | **双时钟分离**：新增 `lastActiveAt`（`e67c2f5`） | 守护唤醒不更新 `lastSelfTurnAt` → 启动自检每次重启误判「206 分钟无感知」 |
 | 2026-09-12 | **跳过退避 + 停摆告警 + 停摆自愈**（v0.2.1，`be46312`） | 29 小时零真实感知圈而日志显示「每 5 分钟都在安排」——跳过分支回写「立即到期」= 无限紧转轮 |
-| 2026-09-22 | **`today()` 改本地自然日**（`f9956b3`）——原实现 `new Date().toISOString().slice(0, 10)` 取的是 **UTC 日历日** | 本机 UTC+8：本地 **08:00** 一到 UTC 就跨天，「今日圈数」被腰斩（00:00–08:00 的圈记进"昨天"；实测感知圈从「第 30 圈」突变为「第 0 圈」）；且同一份状态行里 `inject.ts` 的小时用的是**本地** `getHours()` ⇒ **一行读数混着两个时区**。语义意图（`loadState` 注释「自然日滚动」）本就是本地自然日 ⇒ 属**实现与意图不符**，非新需求。 |
+| 2026-09-25 | **时间线上界修复**：`readTimeline` 的 `slice(-Math.max(limit, lines.length))` → `Math.min`（并显式处理 `limit<=0`） | `limit` 是**空转参数**：`Math.max` 让上界恒等于总行数 ⇒ `slice(-len)` 返回**全量**。症状：`life_core_status(includeTimeline=true)` 一次吐 **375,580 字节**（自 08-18 起的全部存在事件），且随天数增长——**增长型上下文炸弹**。判据 `tests/timeline-bound.test.mjs`（喂 200 行尸体：旧产物 **4/5 红**、新产物 **57/57 绿**）；`limit<=0` 显式空数组（`slice(-0)` === `slice(0)` 会再变全量）。 |
 
 - **2026-09-22 行尾归一（D3 复核：判为 mtime 抖动，非语义漂移）**：本仓存量的 CRLF 工作区文件被强制重检出为 LF（`git add --renormalize .` 归一索引 + `rm && git checkout` 重写工作区），**触碰了 impl 落点的 mtime** ⇒ `semantic_check` 报 D3「实现比文档新」。实现内容一字未改（`git diff HEAD --stat` 为空即证）——触发量是行尾，不是语义。⇒ 归入 D3 的 mtime 抖动型误报，已在 `t-c54b41c6` / `t-9a4a045e` 记录。
 

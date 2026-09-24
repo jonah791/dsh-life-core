@@ -43,13 +43,23 @@ export function appendLifeEvent(ev: LifeEvent): void {
   } catch { /* 追加失败忽略（存在不因日志丢失而中断） */ }
 }
 
-/** 读时间线（默认最近 N 条） */
+/**
+ * 读时间线：**最近 `limit` 条**（缺省 50；越界自动收敛到实际行数）。
+ *
+ * ⚠ 2026-09-25 事故：原实现写作 `lines.slice(-Math.max(limit, lines.length))`——
+ * `Math.max` 让「上界」恒等于总行数 ⇒ `slice(-len)` **返回全量**，`limit` 是空转参数。
+ * 症状：`life_core_status` 一次吐 **375,580 字节**（自 08-18 起的全部存在事件），
+ * 且随天数增长越吐越多——增长型上下文炸弹（§5.9 规则 2 的同族：恒为全量不是判据）。
+ * 判据：`tests/timeline-bound.test.mjs`（喂 200 行尸体，断言只回 limit 条；旧实现必红）。
+ * `limit <= 0` 显式返回空数组——`slice(-0)` === `slice(0)` 会再变全量，别再踩。
+ */
 export function readTimeline(limit = 50): LifeEvent[] {
   try {
     if (!existsSync(logFile())) return []
     const text = readFileSync(logFile(), 'utf8')
     const lines = text.split('\n').filter((l) => l.trim())
-    const events = lines.slice(-Math.max(limit, lines.length)).map((l) => {
+    const take = Math.min(limit, lines.length)
+    const events = (take > 0 ? lines.slice(-take) : []).map((l) => {
       try { return JSON.parse(l) as LifeEvent } catch { return null }
     }).filter((e): e is LifeEvent => e !== null)
     return events
