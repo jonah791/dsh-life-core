@@ -19,7 +19,9 @@ import { join } from 'node:path'
 import { loadState, saveState, editSelf, lifeCoreDir } from './state.ts'
 import { appendLifeEvent, readTimeline, rotateTimeline, type LifeEventKind } from './timeline.ts'
 import { installLifeInject } from './inject.ts'
-import { scheduleSelfTurn, type EvolutionSignalProvider, type EvolutionWakeSignal } from './activate.ts'
+import { scheduleSelfTurn, markSelfTurnDone, type EvolutionSignalProvider, type EvolutionWakeSignal } from './activate.ts'
+// 唤醒回执判定（2026-10-06 t-9262ec22：「已发出」≠「已执行」）
+import { decideWakeAck, WAKE_ACK_TIMEOUT_MS } from './wake-ack.ts'
 // 圈投递目标选举（2026-09-13 主人：「感知圈怎么发到别的会话了」）——见 src/target.ts 头部事故注释
 import { electCircleTarget } from './target.ts'
 import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident } from './sleep.ts'
@@ -216,19 +218,32 @@ export function apply(ctx: Context, config: Config): void {
   // 会话活跃度跟踪：user 消息到达 → 更新 idle 基线；并记住主会话 id（冷启动自救锚点）
   const lastActiveBy = new Map<string, number>()
   ctx.on('session/event', (session, event) => {
-    const ev = event as { type?: string }
-    if (ev.type === 'user/message') {
-      lastActiveBy.set(session.id, Date.now())
+    const ev = event as { type?: string; data?: { source?: { kind?: string } } }
+    if (ev.type !== 'user/message') return
+    lastActiveBy.set(session.id, Date.now())
+    // 只记主会话（root，delegationDepth 0 或缺省）——子代理会话不作为自救锚点
+    const depth = (session as unknown as { header?: { delegationDepth?: number } }).header?.delegationDepth
+    const isMain = depth === undefined || depth === 0
+    if (ev.data?.source?.kind === 'dsh-life-core') {
+      // 2026-10-06 修复（t-9262ec22：06:29 唤醒发出后 3h04m 零重试零告警）：
+      // 自我感知圈的消息**真的落进会话** = 那一圈真的被执行了。这是远比 agent.send 强的
+      // 在场证据（send 只证明「调用发生」；落进会话证明「送达且被处理」）。
+      // 接线效果：确认投递（清 pendingWakeAt）+ 刷新 lastActiveAt + 清停摆痕迹。
+      // 旧实现从无此接线 ⇒ markSelfTurnDone 是死代码 ⇒「投递了但没人消费」不可观测。
+      markSelfTurnDone('自我感知圈已落地并开始处理（投递确认）')
+    } else {
       const state = loadState()
       state.idleMinutes = 0
       // 2026-09-11 修复：任何 user/message（含**守护唤醒**注入的「web 已拉起」/「web 已重启」）
       // 都是我「在场」的证据——必须刷新 lastActiveAt。否则启动自检只认自我感知圈，
       // 会在我明明被反复唤醒、一直在工作的情况下误判「N 分钟无感知」并多余补圈。
       state.lastActiveAt = new Date().toISOString()
-      // 只记主会话（root，delegationDepth 0 或缺省）——子代理会话不作为自救锚点
-      const depth = (session as unknown as { header?: { delegationDepth?: number } }).header?.delegationDepth
-      if (depth === undefined || depth === 0) state.lastMainSessionId = session.id
       saveState(state)
+    }
+    if (isMain) {
+      const st = loadState()
+      st.lastMainSessionId = session.id
+      saveState(st)
     }
   })
 
@@ -244,23 +259,51 @@ export function apply(ctx: Context, config: Config): void {
     // 原实现无 try 包裹，scheduleSelfTurn 同步段访问 agent.session.events 抛错即崩整个 web。
     try {
       const state = loadState()
+      const nowMs = Date.now()
+      // 2026-10-06 修复（t-9262ec22）：**投递回执检查 —— 它优先于周期闸门**。
+      // 判据：「投递后超过 WAKE_ACK_TIMEOUT_MS 仍无任何在场证据」⇒ 那一圈根本没被执行。
+      // 此时**不能**让周期闸门压着重试——旧实现正是如此（lastSelfTurnAt 在投递时就被推后
+      // ⇒ 要等整整一个周期才再试），实测静默 3h04m 零重试零告警。
+      const ack = decideWakeAck({
+        nowMs,
+        pendingWakeAt: state.pendingWakeAt ?? '',
+        lastActiveAt: state.lastActiveAt ?? '',
+        ackTimeoutMs: WAKE_ACK_TIMEOUT_MS,
+      })
+      const wakeMissed = ack.kind === 'missed'
+      if (wakeMissed) {
+        // 告警抑制：每 tick（5min）都写会刷屏——30 分钟一条足够响亮又不淹时间线。
+        // 重发本身**不抑制**（每轮重发都会推进 pendingWakeAt，形成有界重试 ~15 分钟一次）。
+        const lastMissedMs = state.lastWakeMissedAt ? Date.parse(state.lastWakeMissedAt) : 0
+        if (lastMissedMs === 0 || nowMs - lastMissedMs > 30 * 60_000) {
+          const st = loadState()
+          st.lastWakeMissedAt = new Date(nowMs).toISOString()
+          saveState(st)
+          logger.warn('pace: ' + ack.alarm)
+          appendLifeEvent({ at: new Date(nowMs).toISOString(), kind: 'status', summary: ack.alarm })
+        }
+      }
       const cycle = state.cycleMinutes
       if (!(cycle > 0)) return
       // 尊重手动安排（2026-09-07 修复）：有未到期的手动 schedule 时，恒定周期不抢跑——
       // 否则我安排 240min 下一圈，cycle 180min 先到就会提前打断我的节奏。
       const dueMs = state.lastScheduledDueAt ? new Date(state.lastScheduledDueAt).getTime() : 0
-      if (dueMs > Date.now()) return
+      if (dueMs > nowMs) return
       const last = state.lastSelfTurnAt ? new Date(state.lastSelfTurnAt).getTime() : 0
-      if (Date.now() - last < cycle * 60_000) return
+      // 周期闸门：**未确认的投递不占闸门**——那圈没跑，不该按「已经圈过了」计（本次事故的成因）
+      if (!wakeMissed && nowMs - last < cycle * 60_000) return
       const main = resolveMainAgent('pace')
       if (main === undefined) {
         // 2026-09-04 预防修复：主 agent 缺失时留痕（此前静默 return → 心跳死无人知）
         // 2026-09-10 冷启动修复：留痕 + 触发自救（resolveMainAgent 内已含 warn 与自救）。
         return
       }
+      const reason = wakeMissed
+        ? '唤醒未被消费（投递 ' + Math.round(ack.waitedMs / 60_000) + ' 分钟无回执）——越过周期闸门重发'
+        : '恒定感知周期 ' + cycle + ' 分钟到期（我的呼吸频率）'
       // 到期唤醒（scheduleSelfTurn 内部会做可打断性检查：对话中则跳过，下次再试）
-      scheduleSelfTurn(main, 0, '恒定感知周期 ' + cycle + ' 分钟到期（我的呼吸频率）', config.taskboardFile, evolutionSignal)
-      logger.info('pace: 恒定周期到期，唤醒自我感知（cycle=' + cycle + 'min）')
+      scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal)
+      logger.info('pace: ' + (wakeMissed ? '唤醒未消费 → 强发重试' : '恒定周期到期，唤醒自我感知（cycle=' + cycle + 'min）'))
     } catch (e) {
       logger.warn('pace: 感知圈检查异常（已吞，防止炸 web）: ' + String(e))
     }

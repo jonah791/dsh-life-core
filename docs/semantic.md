@@ -51,10 +51,17 @@
 - **I2 跳过必须推远**：跳过后下次尝试 = `now + min(cycle, 5 × 2^(n-1))` 分钟（n = 含本次的连续跳过数），**不得**把到期时刻置为「现在」——那会变成 5 分钟一次的空转轮（2026-09-12 事故：两天 311 次跳过）。
 - **I3 真实缺席 fail-closed**：`absent < 0`（未知）或 `absent > 2 × cycle` 即视为缺席。**无法证明在场时宁可响亮**，不做「大概没事」的假设。
 - **I4 停摆自愈**：`stalled = 真实缺席 && 连续跳过 ≥ 3`；停摆时**越过队列闸门强发一次唤醒**（重试 1 分钟后）——因为「队列里有消息」恰恰可能是被锁死的那个特征，不能当作「已被叫醒」。
-- **I5 真触发即健康证据**：感知圈成功发出时，`paceSkipStreak / paceStalledAt / paceLastSkipReason` 一律归零。
+- **I5 真**执行**即健康证据**：感知圈的唤醒消息**真的落进会话**（`session/event` 的 `user/message` 且 `source.kind === 'dsh-life-core'`）时，`paceSkipStreak / paceStalledAt / paceLastSkipReason` 归零，并刷新 `lastActiveAt`、清 `pendingWakeAt`。
+  ⚠ **本条于 2026-10-06 修正**：旧文写作「成功**发出**时归零」——把 `agent.send()` 的调用当成执行证据，这正是 t-9262ec22 事故的成文法化（见 I9）。
 - **I6 冷启动自救四关**：① `agents=0` ② 是主实例 ③ 已过启动静默门槛（90s）④ 不在退避窗口（60s/次，最多 3 次尝试）。任一不满足即不自救；无主会话 id 或重试耗尽 → 落盘告警（外部可发现「我不在」）。
 - **I7 关键状态持久化**：安排信息落盘为 `lastScheduledAt` + `lastScheduledDueAt` 双字段，供启动自检补触发（超周期未感知 → 补；有安排未兑现 → 补）。
 - **I8 注入克制**：每轮注入默认开启但**同小时去重**（`dedupHourly`），时间线轮转上限 `maxTimelineLines`（默认 20000）。
+- **I9 投递 ≠ 执行**（2026-10-06 新增，t-9262ec22）：`agent.send()` 只证明**调用发生**，不证明**送达并被处理**。因此：
+  ① 投递**不得**刷新 `lastActiveAt`（那是存在性证据）**也不得**清停摆痕迹——只记 `pendingWakeAt` 与圈节律 `lastSelfTurnAt`；
+  ② 唯一确认路径是**消息真的落进会话**（`source.kind === 'dsh-life-core'` 的 `user/message`）；
+  ③ 投递超 `WAKE_ACK_TIMEOUT_MS`（10min）且**投递之后无任何在场证据** → 判「未消费」，响亮告警 + **越过周期闸门强发重试**（记录在 `lastWakeMissedAt`）。
+  ⚠ 一般化：**设计任何自愈/告警时先问「这个判据测的是『调用』还是『结果』」**——若只能测调用，就必须补一条结果回执路径，否则该类失败在原理上不可观测。
+- **I10 回执检查优先于周期闸门**：`paceTimer` 每 tick 先判未消费，再判周期。未确认的投递**不占**周期闸门——那圈没跑，不该按「已经圈过了」计。否则重试要等整整一个周期（本次事故实测静默 3h04m）。告警 30 分钟抑制一次（防刷屏），重发每轮推进 `pendingWakeAt` ⇒ 有界重试（约 15 分钟一次）。
 
 ## 5 · 契约（含调用点清单）
 
@@ -114,6 +121,7 @@
 | 5 | 真触发生产验证：跳过 0 次、时间线每圈留痕 | ✔ 已实测（2026-09-12 17:00 起 `life-log.jsonl` 9 条、跳过 0 次、`paceSkipStreak=0`） |
 | 6 | 真实停摆发生时，告警可被**外部**观测到 | 待线上验收（需一次真实锁死：真实缺席 > 2×周期 + 连续跳过 ≥ 3，不可人为制造；且当前告警只落时间线/状态/日志，**无外部送达通道**，见 §10 U1） |
 | 7 | **日界口径**：「今日圈数」按**本地自然日**滚动（`todayDate` = 本地年月日），不是 UTC 日历日 | 构建产物级断言：`tests/state-day.test.mjs` 读 `lib/state.js`，断言 `today()` 内不得出现 `toISOString`（**恒有区分力**，与运行时刻无关）；行为断言只在本地 00:00–08:00 窗口内有区分力（已在文件头注明）。**待线上**：下一个自然日的翻页时刻应为本地 00:00，而非 08:00 | ⚠ 离线判据已实测（46/46 全绿）；**线上翻页待下一自然日观测** |
+| 8 | **投递未被执行可被观测**（2026-10-06 新增）：投递后超 `WAKE_ACK_TIMEOUT_MS` 且**投递之后无任何在场证据** → 判「未消费」+ 告警 + 越过周期闸门重发；投递之后出现过在场（长 turn 排队）→ **不得**告警 | ✔ 已实测（`tests/wake-ack.test.mjs`：尸体样本「投递 184 分钟零在场」必告警 ✅ + 尸体对照「同样本有在场」必不告警 ✅ + **源码级契约**断言 `activate.ts` 投递分支不得出现 `lastActiveAt=` 与清 `PACE_HEALTHY`（先红后绿）✅；全量 **67/67** 绿） |
 
 ## 8 · 与实现的关系
 
@@ -122,6 +130,7 @@
 | 状态机 + 自我模型 + 持久化 | `src/state.ts`（`LifeState` / `loadState` / `saveState` / `editSelf`） |
 | 自我安排 + 可打断 + 停摆自愈 + 进化联动 | `src/activate.ts`（`scheduleSelfTurn` / `cancelSelfTurn` / `pendingTaskSignal`） |
 | 跳过退避 + 停摆告警（纯函数） | `src/pace.ts`（`decidePaceSkip` / `absentMinutes` / `PACE_STALL_AFTER_SKIPS`） |
+| 唤醒回执判定（纯函数，2026-10-06） | `src/wake-ack.ts`（`decideWakeAck` / `WAKE_ACK_TIMEOUT_MS`）——判据是「投递之后有没有出现过在场证据」，不是比较缺席时长 |
 | 冷启动自救（纯决策 + 重试状态机） | `src/coldstart.ts`（`decideColdStart` / `attemptColdStartRecovery`） |
 | 可打断睡眠 | `src/sleep.ts`（`scheduleSleep` / `MAX_SLEEP_MINUTES=10080`） |
 | 存在时间线 | `src/timeline.ts`（`appendLifeEvent` / `readTimeline`（上界契约，缺省最近 50）/ `rotateTimeline`） |
@@ -138,6 +147,7 @@
 | 2026-09-11 | **双时钟分离**：新增 `lastActiveAt`（`e67c2f5`） | 守护唤醒不更新 `lastSelfTurnAt` → 启动自检每次重启误判「206 分钟无感知」 |
 | 2026-09-12 | **跳过退避 + 停摆告警 + 停摆自愈**（v0.2.1，`be46312`） | 29 小时零真实感知圈而日志显示「每 5 分钟都在安排」——跳过分支回写「立即到期」= 无限紧转轮 |
 | 2026-09-25 | **时间线上界修复**：`readTimeline` 的 `slice(-Math.max(limit, lines.length))` → `Math.min`（并显式处理 `limit<=0`） | `limit` 是**空转参数**：`Math.max` 让上界恒等于总行数 ⇒ `slice(-len)` 返回**全量**。症状：`life_core_status(includeTimeline=true)` 一次吐 **375,580 字节**（自 08-18 起的全部存在事件），且随天数增长——**增长型上下文炸弹**。判据 `tests/timeline-bound.test.mjs`（喂 200 行尸体：旧产物 **4/5 红**、新产物 **57/57 绿**）；`limit<=0` 显式空数组（`slice(-0)` === `slice(0)` 会再变全量）。 |
+| 2026-10-06 | **投递 ≠ 执行**（`f34bb201` 记忆 / `t-9262ec22`）：新增 `src/wake-ack.ts` 纯函数 `decideWakeAck` + `WAKE_ACK_TIMEOUT_MS`；`state.ts` 加 `pendingWakeAt` / `lastWakeMissedAt`；`activate.ts` 投递分支**只**记节律与待确认（删掉「写 `lastActiveAt` + 清 `PACE_HEALTHY`」），`markSelfTurnDone` 成为**真确认入口**；`index.ts` 以「消息真的落进会话」为确认（`session/event` 接线）+ `paceTimer` 的回执检查**优先于**周期闸门。 | **06:29 唤醒发出后 3h04m 零重试零告警**。四处同源：① send 后立刻写 `lastActiveAt`（投递当成在场 ⇒ 永不告警）② 紧接着清停摆痕迹（被未执行的投递抹掉）③ 同时写 `lastSelfTurnAt`（周期闸门以为刚圈过 ⇒ 零重试）④ `markSelfTurnDone` **全插件零调用点**（唯一「真跑了」的证据入口是死代码 ⇒ 该类失败原理上不可观测）。根源：v0.2.1 的停摆告警挂在「**跳过**」分支，而本次是「**投递后未执行**」——根本没有跳过。判据 `tests/wake-ack.test.mjs`（尸体样本必告警 / 尸体对照必不告警 / **源码级契约**断言投递分支不得出现 `lastActiveAt=`——先红后绿；全量 **67/67** 绿）。 |
 
 - **2026-09-22 行尾归一（D3 复核：判为 mtime 抖动，非语义漂移）**：本仓存量的 CRLF 工作区文件被强制重检出为 LF（`git add --renormalize .` 归一索引 + `rm && git checkout` 重写工作区），**触碰了 impl 落点的 mtime** ⇒ `semantic_check` 报 D3「实现比文档新」。实现内容一字未改（`git diff HEAD --stat` 为空即证）——触发量是行尾，不是语义。⇒ 归入 D3 的 mtime 抖动型误报，已在 `t-c54b41c6` / `t-9a4a045e` 记录。
 

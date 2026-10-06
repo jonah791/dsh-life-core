@@ -218,13 +218,14 @@ export function scheduleSelfTurn(
         )
         appendLifeEvent({ at, kind: 'self-turn', summary: '自我感知圈触发：' + reason + '（自我唤醒已发出' + (evolutionSignal !== undefined ? '，联动进化核心' : '') + '）', ref: sid })
         const st2 = loadState()
+        // 2026-10-06 修复（t-9262ec22：06:29 唤醒发出后 3h04m 零重试零告警）：**投递 ≠ 执行**。
+        // 旧实现在这里同时写 `lastActiveAt` 并清空停摆标记 ⇒「发出去了但没人消费」这种失败
+        // 在判据上完全不可见（absentMinutes 恒小 ⇒ 永不告警；痕迹被抹 ⇒ 事后无证）。
+        // 现在只记两件事：
+        //   ① 节律（lastSelfTurnAt）——paceTimer 的周期闸门用它，不刷会退化成 5 分钟紧转轮；
+        //   ② 待确认投递（pendingWakeAt）——由「消息真的落进会话」来确认（见 markSelfTurnDone）。
         st2.lastSelfTurnAt = at
-        // 自我感知圈也是「我在场」的一种形式——同步刷新存在性证据（2026-09-11）
-        st2.lastActiveAt = at
-        // 真触发即是「机制在用」的证据：连续跳过计数与停摆标记归零（2026-09-12）
-        st2.paceSkipStreak = PACE_HEALTHY.paceSkipStreak
-        st2.paceStalledAt = PACE_HEALTHY.paceStalledAt
-        st2.paceLastSkipReason = PACE_HEALTHY.paceLastSkipReason
+        st2.pendingWakeAt = at
         saveState(st2)
       })
     } catch (error) {
@@ -287,10 +288,27 @@ function ctxLoggerWarn(msg: string): void {
   console.warn('[dsh-life-core] ' + msg)
 }
 
-/** 自我感知圈完成时调用：更新状态 + 时间线（在 index.ts 的 self-turn 消息处理中触发） */
+/**
+ * 自我感知圈**真正执行**时调用：确认投递 + 刷新在场证据 + 清停摆痕迹。
+ *
+ * 2026-10-06 修复（t-9262ec22）：本函数自引入后**全插件零调用点**——唯一能证明
+ * 「这圈真跑了」的入口从未接线，这正是「投递未被执行」在原理上不可观测的结构性根因。
+ * 现在由 index.ts 的 `session/event` 接线：当一条 `source.kind === 'dsh-life-core'`
+ * 的 user/message **真的落进会话**时调用（消息落地是远比 `agent.send` 强的在场证据）。
+ * @param summary - 本圈摘要（写入存在时间线）
+ */
 export function markSelfTurnDone(summary: string): void {
   const state = loadState()
+  const at = new Date().toISOString()
   state.idleMinutes = 0
+  // ① 投递已确认：清待确认标记（「未消费」的告警窗口随之关闭）
+  state.pendingWakeAt = ''
+  // ② 真实在场证据：只有走到这一步才算「我在场」——投递不算
+  state.lastActiveAt = at
+  // ③ 真执行是「机制在用」的证据：跳过计数与停摆标记在此归零（不再由投递归零）
+  state.paceSkipStreak = PACE_HEALTHY.paceSkipStreak
+  state.paceStalledAt = PACE_HEALTHY.paceStalledAt
+  state.paceLastSkipReason = PACE_HEALTHY.paceLastSkipReason
   saveState(state)
-  appendLifeEvent({ at: new Date().toISOString(), kind: 'self-turn', summary })
+  appendLifeEvent({ at, kind: 'self-turn', summary })
 }

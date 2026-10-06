@@ -44,6 +44,24 @@ export interface LifeState {
   /** 最近一次跳过的原因（供停摆告警与事后诊断引用） */
   paceLastSkipReason: string
   /**
+   * 最近一次**投递**自我唤醒的时刻（ISO；空串 = 没有待确认的投递）。
+   *
+   * 2026-10-06 新增（t-9262ec22：06:29 唤醒发出后 3h04m 零重试零告警）：
+   * `agent.send(...)` 只是**投递**，不是执行。旧实现在 send 之后立刻刷新
+   * `lastActiveAt` 并清空 `paceSkipStreak`/`paceStalledAt` ⇒ 投递被当成在场与执行证据
+   * ⇒ 「投递了但没人消费」这种失败形态**原理上不可观测**。
+   * 现改为：投递只记本字段；**真正确认只由「消息真的落进会话」产生**（见 activate.ts
+   * `markSelfTurnDone` 与 index.ts 的 `session/event` 接线）。
+   */
+  pendingWakeAt: string
+  /**
+   * 最近一次判定「唤醒未被消费」的时刻（ISO；空串 = 从未发生）。
+   *
+   * 与 `paceStalledAt` 的分工：后者是**跳过**累计导致的停摆；本字段是**投递未执行**导致的
+   * 静默。两者是不同故障形态，必须分开留痕——否则「未消费」的痕迹会被下一次投递抹掉。
+   */
+  lastWakeMissedAt: string
+  /**
    * 最近一次「我在场」的时间戳——**任何形式**的活跃都算（主人消息 / 守护唤醒 / 自我感知圈）。
    *
    * 2026-09-11 新增，修复一处语义混淆：`lastSelfTurnAt` 只在**自我感知圈**路径更新
@@ -130,6 +148,8 @@ export function loadState(): LifeState {
     paceSkipStreak: 0,
     paceStalledAt: '',
     paceLastSkipReason: '',
+    pendingWakeAt: '',
+    lastWakeMissedAt: '',
     lastMainSessionId: '',
     self: { ...DEFAULT_SELF, concerns: [...DEFAULT_SELF.concerns], values: { ...DEFAULT_SELF.values } },
     bornAt: now,
