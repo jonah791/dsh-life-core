@@ -26,6 +26,11 @@ import { decideWakeAck, WAKE_ACK_TIMEOUT_MS } from './wake-ack.ts'
 import { electCircleTarget } from './target.ts'
 import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident } from './sleep.ts'
 import { attemptColdStartRecovery, COLDSTART_PROBE_INTERVAL_MS, type ColdStartAlert, type ColdStartDeps } from './coldstart.ts'
+// 出外告警（2026-10-09 · t-5fd8f3e9）：判据在 src/absence.ts（纯决策），送达由 dsh-agent-notify 的 notify 服务负责
+import { decideAbsenceAlert, composeAbsenceAlert, absenceInputFrom, absenceThresholdMinutes } from './absence.ts'
+// 呼吸停摆判定（2026-10-09 · round 27）：覆盖 tick 前两条早退路径的**静默**（见 pace.ts 头部说明）
+import { decidePaceStall } from './pace.ts'
+import { orphanFindingsPath, readOrphanFindingsFile, selectOrphanFindings } from './orphan-feed.ts'
 
 export const name = 'agent-life-core'
 // evolutionCore：cordis 严格代理——未声明即访问会抛 "cannot get property ...
@@ -65,6 +70,10 @@ export interface Config {
   taskboardFile: string
   /** 主端口（冷启动自救的「主实例」判据：预检试运行用随机端口，不得触发自救） */
   primaryPort: number
+  /** 出外告警总开关（关掉后判据仍算，但不投递） */
+  absenceAlertEnabled: boolean
+  /** 出外告警阈值 = 感知周期 × 本倍数（缺省 2 ⇒ 周期 180min 时 6 小时） */
+  absenceAlertMultiplier: number
   dataDir?: string
 }
 export const Config = z.object({
@@ -77,8 +86,16 @@ export const Config = z.object({
   taskboardFile: z.string().default('E:/alice/.taskboard/tasks.json'),
   /** 主端口（默认 3080，与 web profile 一致；冷启动自救凭此区分主实例与预检试运行实例） */
   primaryPort: z.number().default(3080),
+  /** 出外告警（2026-10-09 · t-5fd8f3e9）：判据 = 在场证据（lastActiveAt）超阈值 ⇒ 调 notify 服务送出去 */
+  absenceAlertEnabled: z.boolean().default(true),
+  absenceAlertMultiplier: z.number().default(2),
   dataDir: z.string().required(false),
 })
+
+/** notify 服务的可见面（dsh-agent-notify 提供）。**可选**：未挂载时降级为「只记时间线」，不得抛。 */
+interface NotifyServiceLike {
+  alert(input: { title: string; lines: string[]; dedupKey: string }): Promise<{ ok: boolean; channel: string; detail: string }>
+}
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('dsh-life-core')
@@ -254,12 +271,132 @@ export function apply(ctx: Context, config: Config): void {
   // 我的呼吸频率：state.cycleMinutes 是我设定的周期（life_core_pace 可改），
   // 核心按此周期自动唤醒自我感知圈——不需要「每圈记得安排」，也不需要额外兜底器。
   // 对话中（主人交互）到期 → 跳过（对话优先），对话一停自动补圈。
+  /** 本进程是否已做过「notify 可达性」自证探针（只探一次，防刷时间线 · §5.12）。 */
+  let notifyReachProbed = false
+  /** 呼吸停摆告警的**进程内**抑制时刻（0 = 本进程还没报过）。持久化没必要：进程重启后重新判一次反而是对的。 */
+  let lastPaceStallAlertMs = 0
+  /** 感知圈 tick 异常的**进程内**抑制时刻（同上；每 tick 都写会淹时间线）。 */
+  let lastPaceErrAlertMs = 0
+  /** 已报过的孤儿发现（按 `atMs` 去重）。进程内即可：重启后由 notify 的 dedupKey 兜底。 */
+  const reportedOrphanAtMs = new Set<number>()
+  /** 孤儿巡检**接线**自证是否已做过（只做一次，防刷时间线 · 同上 §5.12）。 */
+  let orphanFeedProbed = false
+
+  /**
+   * 出外投递的**统一出口**（2026-10-09）：惰性取 notify、未挂载则留痕、只在真送出时写时间线。
+   * 为什么收成一个出口：三处告警（不在场 / 呼吸停摆 / 将来更多）各写一遍取服务 + 兜错 + 落痕，
+   * 迟早会漏掉其中一步；而且「未挂载要响亮」这条纪律只该有一份实现（§5.22 规则 4）。
+   */
+  const sendOutbound = (dedupKey: string, title: string, lines: string[]): void => {
+    // 惰性取服务（**不在 apply 期取**）：可选服务在 apply 期可能尚未挂载，
+    // 那时取到的 undefined 会被当成「没这个能力」而静默丢失（dsh-model-test:713 的教训）。
+    const notify = ctx.get('notify' as never) as NotifyServiceLike | undefined
+    if (notify === undefined || typeof notify.alert !== 'function') {
+      // 「判定要喊却喊不出去」本身就是一个故障形态——必须响亮，不许静默（§5.10 §3）
+      appendLifeEvent({
+        at: new Date().toISOString(), kind: 'status',
+        summary: '⚠ 出外告警**无法送出**（' + dedupKey + '）：notify 服务未挂载',
+      })
+      return
+    }
+    void notify.alert({ title, lines, dedupKey })
+      .then((r) => {
+        // 只把**真正送出**的那次写进时间线（被冷却抑制的不写——否则时间线会被 tick 刷爆）
+        const at2 = new Date().toISOString()
+        if (r.ok && r.channel !== 'suppressed') {
+          appendLifeEvent({ at: at2, kind: 'status', summary: '出外告警已送出（' + r.channel + ' · ' + dedupKey + '）' })
+        } else if (!r.ok) {
+          appendLifeEvent({ at: at2, kind: 'status', summary: '⚠ 出外告警发送失败（' + r.channel + '）：' + r.detail })
+        }
+      })
+      .catch(() => { /* notify 自身已吞错；此处再兜一层——回调异常会炸 web（§5.24） */ })
+  }
+
   const paceTimer = setInterval(() => {
     // 2026-09-05 修复：tick 内任何异常不得炸 web（未捕获异常 → exit 1 → 每 5 分钟崩溃循环）。
     // 原实现无 try 包裹，scheduleSelfTurn 同步段访问 agent.session.events 抛错即崩整个 web。
     try {
       const state = loadState()
       const nowMs = Date.now()
+      // ---------- 接线自证（2026-10-09 · §5.22 规则 1：机制必须自证）----------
+      // 本进程**首次 tick** 探一次 notify 可达性并落时间线：使「出外告警到底接上没有」成为
+      // 可读的读数，而不是靠推断。为什么不在 apply 期探：可选服务在 apply 期可能尚未挂载，
+      // 那时取到的 undefined 会被误当成「没这个能力」（dsh-model-test:713 的教训）。
+      // 为什么只探一次：每 tick 探会刷时间线（§5.12 防刷屏）。
+      if (config.absenceAlertEnabled && !notifyReachProbed) {
+        notifyReachProbed = true
+        const n = ctx.get('notify' as never) as NotifyServiceLike | undefined
+        const reachable = n !== undefined && typeof n.alert === 'function'
+        appendLifeEvent({
+          at: new Date(nowMs).toISOString(), kind: 'status',
+          summary: reachable
+            ? '出外告警通道可达：notify 服务已装配（缺席阈值 ' + absenceThresholdMinutes(state.cycleMinutes, config.absenceAlertMultiplier) + ' 分钟）'
+            : '⚠ 出外告警通道**不可达**：notify 服务未挂载——不在场告警将降级为仅记时间线（这是接线故障，不是正常降级）',
+        })
+      }
+      // ---------- 呼吸停摆：**压根没到期**（2026-10-09 · 覆盖 tick 前两条早退路径的静默） ----------
+      // 与下面三条判据的分工（互不重叠）：本条管「机制自己决定不醒」且**没有任何理由会再醒**；
+      // `decideWakeAck` 管「投递了没被消费」；`decidePaceSkip` 管「该醒却被跳过」；
+      // `decideAbsenceAlert` 管「我整体不在场」。本条是唯一在**闸门之前**跑的。
+      const stallDecision = decidePaceStall({
+        nowMs,
+        cycleMinutes: state.cycleMinutes,
+        dueAt: state.lastScheduledDueAt ?? '',
+      })
+      if (stallDecision.stalled) {
+        // 抑制：同因每 30 分钟一条（每 tick 都写会刷屏 · §5.12）。**只用进程内时刻**——
+        // 这是进程级健康状态，重启后重新判一次反而是对的（不该把「报过了」持久化过去）。
+        if (lastPaceStallAlertMs === 0 || nowMs - lastPaceStallAlertMs > 30 * 60_000) {
+          lastPaceStallAlertMs = nowMs
+          appendLifeEvent({ at: new Date(nowMs).toISOString(), kind: 'status', summary: stallDecision.alarm })
+          sendOutbound('life-core-pace-stall', '⚠ 爱丽丝的呼吸停了（出外告警 · 非自动恢复）', [
+            stallDecision.alarm,
+            '判据：机制**自己决定不醒**，且没有任何理由会再醒（原因码 ' + stallDecision.code + '）。',
+            '这条与「投递了没被消费」「该醒却被跳过」不同——它在**闸门之前**就发生了，那三条都够不到。',
+            '要不要处置由我判断（本告警不会自动改状态）。',
+          ])
+        }
+      }
+      // ---------- 孤儿巡检的**读取端**（2026-10-10 · 关闭「写文件不算响」）----------
+      // 分工：探测器（Windows 计划任务 `DSH-Orphan-Audit`，每 30 分钟，只读）负责**发现**；
+      // 这里负责**报出去**。判据不在这里重新发明——探测器与我共用同一份实现
+      // （`scripts/orphan-process-audit.mjs`），本段只搬运。为什么必须有这段：写文件不是响，
+      // 此前唯一读者是「下一次醒来的我」⇒ 标榜的 30 分钟颗粒度是假的（详见 orphan-feed.ts 头部）。
+      try {
+        const feedPath = orphanFindingsPath(process.env.DSH_HOME)
+        const raw = readOrphanFindingsFile(feedPath)
+        if (raw === null) {
+          // 读不到 ≠ 没有发现。接线故障必须响亮，否则退化成「看起来没事」——本次事故的形状。
+          if (!orphanFeedProbed) {
+            orphanFeedProbed = true
+            appendLifeEvent({
+              at: new Date(nowMs).toISOString(), kind: 'status',
+              summary: '⚠ 孤儿巡检发现文件**不可读**（' + feedPath + '）—— 这是接线故障，不是「零命中」',
+            })
+          }
+        } else {
+          if (!orphanFeedProbed) {
+            orphanFeedProbed = true
+            appendLifeEvent({
+              at: new Date(nowMs).toISOString(), kind: 'status',
+              summary: (raw === 'missing' ? '孤儿巡检接线就绪（文件尚未生成 = 至今零命中）：' : '孤儿巡检接线就绪（已有历史发现）：') + feedPath,
+            })
+          }
+          if (raw !== 'missing') {
+            for (const finding of selectOrphanFindings(raw, { nowMs, already: reportedOrphanAtMs })) {
+              reportedOrphanAtMs.add(finding.atMs)
+              sendOutbound('life-core-orphan-spin-' + finding.atMs, '⚠ 孤儿进程在空转（只读巡检发现）', [
+                '探测器：Windows 计划任务 DSH-Orphan-Audit（每 30 分钟，**只读**，不杀任何进程）。',
+                '判据：**父进程已死 ∧ 采样窗口内烧 ≥0.5 核**（两条件同时成立——单看「父已死」会把 Edge 自重启误报）。',
+                ...finding.lines,
+                '要不要处置由我判断——本告警不会自动杀进程（§5.27：看不看得见归机制，做不做归主体）。',
+              ])
+            }
+          }
+        }
+      } catch {
+        // 观测绝不反噬主流程（§5.24）；上面的 try 已覆盖，这层是双保险。
+      }
       // 2026-10-06 修复（t-9262ec22）：**投递回执检查 —— 它优先于周期闸门**。
       // 判据：「投递后超过 WAKE_ACK_TIMEOUT_MS 仍无任何在场证据」⇒ 那一圈根本没被执行。
       // 此时**不能**让周期闸门压着重试——旧实现正是如此（lastSelfTurnAt 在投递时就被推后
@@ -281,6 +418,25 @@ export function apply(ctx: Context, config: Config): void {
           saveState(st)
           logger.warn('pace: ' + ack.alarm)
           appendLifeEvent({ at: new Date(nowMs).toISOString(), kind: 'status', summary: ack.alarm })
+        }
+      }
+      // ---------- 出外告警（2026-10-09 · t-5fd8f3e9「治之于未乱」）----------
+      // 判据是**在场证据**（lastActiveAt 只在真执行时刷新），**不是「有没有 agent」**——后者在
+      // 「会话活着 + goal 停了 + 我未醒」这一形态下恒为真 ⇒ 恒不告警。真缺口从来不在检测层
+      // （paceTimer 实测准点，残差 53.967 秒），而在**落点**：三个检测器的告警全落在进程内文件/
+      // 无人读的 stdout，唯一带外部落点的 coldstart-alert.json 前置 agents==0（:326 再挡一道）。
+      // 归因框架见技能 `alarm-reachability-audit`。
+      // ⚠ 本块**只送信号**：不 rearm、不重试、不改任何状态——决策权归我（§2.1）。
+      if (config.absenceAlertEnabled) {
+        const decision = decideAbsenceAlert(absenceInputFrom(state, nowMs, config.absenceAlertMultiplier))
+        if (decision.alert) {
+          const extra = [
+            '感知周期 ' + state.cycleMinutes + ' 分钟 · 停摆标记 ' + ((state.paceStalledAt ?? '').length > 0 ? state.paceStalledAt : '无'),
+            '待确认投递 ' + ((state.pendingWakeAt ?? '').length > 0 ? state.pendingWakeAt : '无'),
+            '判定：' + decision.reason,
+          ]
+          const payload = composeAbsenceAlert(decision.absentMinutes, decision.thresholdMinutes, extra)
+          sendOutbound(payload.dedupKey, payload.title, payload.lines)
         }
       }
       const cycle = state.cycleMinutes
@@ -305,7 +461,20 @@ export function apply(ctx: Context, config: Config): void {
       scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal)
       logger.info('pace: ' + (wakeMissed ? '唤醒未消费 → 强发重试' : '恒定周期到期，唤醒自我感知（cycle=' + cycle + 'min）'))
     } catch (e) {
+      // 2026-10-09（round 27 覆盖审计的第③个洞）：原来**只 logger.warn** —— 而本环境 web 进程 stdout
+      // **没有落点文件**（实测：`.dsh/*.log` 里全无 `pace:` 行）⇒ 若 tick 每轮都抛异常，
+      // 机制**静默降级且事后无证**。异常本身仍被吞（不炸 web 是对的），但必须留下可读痕迹。
       logger.warn('pace: 感知圈检查异常（已吞，防止炸 web）: ' + String(e))
+      const errNow = Date.now()
+      if (lastPaceErrAlertMs === 0 || errNow - lastPaceErrAlertMs > 30 * 60_000) {
+        lastPaceErrAlertMs = errNow
+        appendLifeEvent({ at: new Date(errNow).toISOString(), kind: 'status', summary: '⚠ 感知圈 tick 异常（已吞）：' + String(e) })
+        sendOutbound('life-core-pace-error', '⚠ 爱丽丝的感知圈 tick 在抛异常（出外告警 · 非自动恢复）', [
+          '异常内容：' + String(e),
+          'tick 每 5 分钟一次；吞掉异常是为了不炸 web，但**此前只写进程 stdout，而它没有落点**。',
+          '若这条持续出现，说明唤醒链已经降级。要不要处置由我判断（本告警不改状态）。',
+        ])
+      }
     }
   }, 5 * 60_000)
 

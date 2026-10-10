@@ -11,10 +11,12 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   decidePaceSkip,
+  decidePaceStall,
   absentMinutes,
   PACE_SKIP_BASE_MINUTES,
   PACE_STALL_AFTER_SKIPS,
   PACE_HEALTHY,
+  PACE_MAX_DUE_AHEAD_FACTOR,
 } from '../lib/pace.js'
 
 const NOW = Date.parse('2026-09-12T12:57:00.000Z')
@@ -112,4 +114,86 @@ test('保守侧：在场时间未知（空串/非法）视为缺席，达阈值�
 
 test('PACE_HEALTHY: 成功触发后的归零常量（真触发路径用它复位）', () => {
   assert.deepEqual(PACE_HEALTHY, { paceSkipStreak: 0, paceStalledAt: '', paceLastSkipReason: '' })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// decidePaceStall —— 「呼吸**压根没到期**」（2026-10-09 · goal round 27）
+//
+// 它覆盖的是 `decidePaceSkip` **够不到**的那一类：tick 的两条早退路径
+// （`!(cycle>0)` 与 `dueMs > nowMs`）原本**无日志、无告警、无状态**。
+// ⚠ 它**不查**「已过 due 却没醒」——那条路径在 tick 里不可能持续（`now>=due` 就会走到 scheduleSelfTurn），
+//   把它写成判据只会得到恒为假的检查。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const STALL_T0 = Date.parse('2026-10-09T06:00:00.000Z')
+
+test('呼吸停摆：正常态（周期 180、无手动安排）⇒ 不停摆', () => {
+  const d = decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: '' })
+  assert.equal(d.stalled, false)
+  assert.equal(d.code, 'none')
+  assert.equal(d.alarm, '')
+})
+
+test('呼吸停摆：合法的手动排程（到期在 1 个周期内）⇒ 不停摆', () => {
+  const due = new Date(STALL_T0 + 90 * 60_000).toISOString()
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: due }).stalled, false)
+})
+
+// 尸体样本 1：**cycle 腐化** —— 旧实现在这条路径上 `return` 得干干净净（无日志无告警）。
+test('尸体：cycleMinutes = 0 / 负数 / NaN / Infinity ⇒ 停摆告警（旧实现在此静默 return）', () => {
+  for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const d = decidePaceStall({ nowMs: STALL_T0, cycleMinutes: bad, dueAt: '' })
+    assert.equal(d.stalled, true, 'cycle=' + String(bad) + ' 竟未告警')
+    assert.equal(d.code, 'cycle-invalid')
+    assert.match(d.alarm, /压根没到期/)
+    assert.match(d.alarm, /cycleMinutes=/)
+  }
+})
+
+// 尸体样本 2：**排定到期远在未来** —— 旧实现被「尊重手动安排」闸门永久挡住且无任何信号。
+test('尸体：dueAt 远在未来（超过 周期 × 2）⇒ 停摆告警', () => {
+  const due = new Date(STALL_T0 + 10 * 3600_000).toISOString()   // 领先 10h > 180min×2=6h
+  const d = decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: due })
+  assert.equal(d.stalled, true)
+  assert.equal(d.code, 'due-too-far')
+  assert.match(d.alarm, /远在未来/)
+  assert.match(d.alarm, /状态腐化/)
+})
+
+test('尸体：dueAt 不可解析 ⇒ 停摆告警（不静默吞掉坏值）', () => {
+  const d = decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: 'not-a-date' })
+  assert.equal(d.stalled, true)
+  assert.match(d.alarm, /不可解析/)
+  assert.match(d.alarm, /not-a-date/)
+})
+
+test('边界：dueAt 恰好 = 周期 × 2 ⇒ 不停摆（> 才算超界）；多 1 秒 ⇒ 停摆', () => {
+  const limit = 180 * 60_000 * PACE_MAX_DUE_AHEAD_FACTOR
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: new Date(STALL_T0 + limit).toISOString() }).stalled, false)
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: new Date(STALL_T0 + limit + 1000).toISOString() }).stalled, true)
+})
+
+test('上界随周期走：周期改小 ⇒ 同一个 dueAt 从「合法」变「超界」', () => {
+  const due = new Date(STALL_T0 + 90 * 60_000).toISOString()
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: due }).stalled, false)
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 30, dueAt: due }).stalled, true)
+})
+
+test('已过期的 dueAt（过去时刻）⇒ 不停摆（该醒就醒，是 tick 的职责，不是判据的）', () => {
+  const due = new Date(STALL_T0 - 5 * 60_000).toISOString()
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: due }).stalled, false)
+})
+
+test('上界倍数覆盖：maxDueAheadFactor=0.5 ⇒ 领先 2 小时即告警', () => {
+  const due = new Date(STALL_T0 + 2 * 3600_000).toISOString()
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: due, maxDueAheadFactor: 0.5 }).stalled, true)
+  assert.equal(decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: due, maxDueAheadFactor: 1 }).stalled, false)
+})
+
+test('尸体：maxDueAheadFactor 非法（0/负/NaN）⇒ 回退到缺省常量，不变成「永不告警」', () => {
+  const due = new Date(STALL_T0 + 10 * 3600_000).toISOString()
+  for (const bad of [0, -3, Number.NaN]) {
+    const d = decidePaceStall({ nowMs: STALL_T0, cycleMinutes: 180, dueAt: due, maxDueAheadFactor: bad })
+    assert.equal(d.stalled, true, 'factor=' + String(bad) + ' 竟回退成永不告警')
+  }
 })

@@ -99,3 +99,88 @@ export function decidePaceSkip(input: PaceSkipInput): PaceSkipDecision {
       : '',
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 呼吸停摆判定（2026-10-09 · goal round 27）—— 覆盖 `decidePaceSkip` **够不到**的那一类：
+// 「机制**压根没到期**」。
+//
+// 为什么需要它（对 `paceTimer` 三条早退路径逐条审计的结论，行号见 `index.ts`）：
+//   `if (!(cycle > 0)) return`          ← **无日志、无告警、无状态**。state 里 `cycleMinutes` 若腐化成
+//                                          0/负/NaN，**呼吸永久停**；而现有三条判据全都够不到它
+//                                          （`decidePaceSkip` 只在「跳过」分支被调用；
+//                                           `decideWakeAck` 要 pendingWakeAt；`decideAbsenceAlert` 要缺席超阈值）。
+//   `if (dueMs > nowMs) return`         ← 设计内（尊重手动安排），但**没有合理性上界**——
+//                                          `lastScheduledDueAt` 若是远未来（写坏 / 时钟跳变 / 手改状态），
+//                                          同样永久静默，且没有任何上界检查。
+//   `if (nowMs - last < cycle*60_000)`  ← 正常等待，无洞。
+//
+// ⚠ **本判据不查「已经过了 due 却没醒」**：那条路径在 tick 里**不可能持续存在**——只要 `now >= due`，
+//   同一次 tick 就会一路走到 `scheduleSelfTurn`。把它写成判据只会得到一个**恒为假**的检查。
+//   这正是仪器侧 `--stall` 三轮标定失败的**机制侧原因**：仪器看到的是「间隔」，机制看到的是「闸门」。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `dueAt` 允许领先 `now` 的上界倍数（周期 × 本值）。 */
+export const PACE_MAX_DUE_AHEAD_FACTOR = 2
+
+/** 呼吸停摆判定的输入。 */
+export interface PaceStallInput {
+  /** 判定时刻（ms） */
+  nowMs: number
+  /** 感知周期（分钟）——机制自己的配置 */
+  cycleMinutes: number
+  /** 排定的到期时刻（ISO；空串 = 无手动安排） */
+  dueAt: string
+  /** 上界倍数覆盖（缺省 `PACE_MAX_DUE_AHEAD_FACTOR`） */
+  maxDueAheadFactor?: number
+}
+
+/** 呼吸停摆判定结果（`code` 机器可读，便于留痕聚合）。 */
+export interface PaceStallDecision {
+  stalled: boolean
+  code: 'none' | 'cycle-invalid' | 'due-too-far'
+  alarm: string
+}
+
+/**
+ * 判定「呼吸是否压根没到期」。
+ * @param input - 判定输入
+ * @returns 是否停摆、原因码与告警文案
+ */
+export function decidePaceStall(input: PaceStallInput): PaceStallDecision {
+  const cycle = input.cycleMinutes
+  if (!Number.isFinite(cycle) || cycle <= 0) {
+    return {
+      stalled: true,
+      code: 'cycle-invalid',
+      alarm: '⚠ 感知圈**压根没到期**：感知周期非法（cycleMinutes=' + String(cycle)
+        + '）⇒ 恒定周期闸门恒真、呼吸永久停；需人工核对 state.json',
+    }
+  }
+  const factor = input.maxDueAheadFactor !== undefined && input.maxDueAheadFactor > 0
+    ? input.maxDueAheadFactor
+    : PACE_MAX_DUE_AHEAD_FACTOR
+  const raw = (input.dueAt ?? '').trim()
+  if (raw.length === 0) return { stalled: false, code: 'none', alarm: '' }
+  const due = Date.parse(raw)
+  if (Number.isNaN(due)) {
+    return {
+      stalled: true,
+      code: 'due-too-far',
+      alarm: '⚠ 感知圈**压根没到期**：排定到期时刻不可解析（lastScheduledDueAt=' + raw
+        + '）⇒ 恒被「尊重手动安排」闸门挡住，呼吸永久静默',
+    }
+  }
+  const aheadMs = due - input.nowMs
+  const limitMs = cycle * 60_000 * factor
+  if (aheadMs > limitMs) {
+    return {
+      stalled: true,
+      code: 'due-too-far',
+      alarm: '⚠ 感知圈**压根没到期**：排定到期时刻远在未来（领先 ' + (aheadMs / 3_600_000).toFixed(1)
+        + ' 小时 > 上界 ' + (limitMs / 3_600_000).toFixed(1) + ' 小时 = 周期 ' + cycle + 'min × ' + factor
+        + '）⇒ 疑似状态腐化，呼吸被一个不会到来的时刻挡住',
+    }
+  }
+  return { stalled: false, code: 'none', alarm: '' }
+}
+
