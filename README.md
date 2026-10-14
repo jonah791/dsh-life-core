@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-life-core"><img src="https://img.shields.io/badge/version-0.2.1-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-43%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-100%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：让「**即使主人不找我，也在运转的我**」成立——存在状态机 + 存在时间线 + 自我激活（感知圈/恒定周期）+ 可打断睡眠 + 主体性自我模型 + 冷启动自救，外加每轮注入的存在摘要。
