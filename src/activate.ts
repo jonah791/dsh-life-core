@@ -86,6 +86,36 @@ export interface EvolutionWakeSignal {
 /** 拉进化快照的函数类型（index.ts 注入 ctx.evolutionCore 闭包） */
 export type EvolutionSignalProvider = () => Promise<EvolutionWakeSignal | null>
 
+/**
+ * 自指引擎联动信号（index.ts 注入，`dsh-agent-self-rewrite` 未挂载时返回 null = 不携带）。
+ *
+ * 存在理由（2026-10-15）：引擎实测停滞 24 天（`active 0` ⇒ 采证环整条停了），而它**没有入口**
+ * 把这件事送到我眼前——`evolution-core` 有感知圈联动，本件没有 ⇒ 只能靠我主动查 `rewrite_status`，
+ * 而「没人推」正是停滞的成因。本信号补上那个入口（库空 / 不可读 ⇒ null，不打扰）。
+ */
+export interface SelfRewriteWakeSignal {
+  /** 一行摘要（最后布线/采证天数 + 在采证条数） */
+  line: string
+  /** 需要动作时的一句（无 ⇒ null） */
+  hint: string | null
+}
+
+/** 拉自指引擎快照的函数类型（index.ts 注入 ctx.selfRewrite 闭包） */
+export type SelfRewriteSignalProvider = () => Promise<SelfRewriteWakeSignal | null>
+
+/**
+ * 把联动段拼进唤醒正文（**纯函数**）。
+ *
+ * 抽出理由（2026-10-15）：原实现把「有没有段」的判定与拼接混在 `buildBody` 闭包里，
+ * 只能靠活体验收（等下一圈）；抽出后判据可离线证伪。
+ *
+ * 判据：**空段数组（或全为空白）⇒ 返回原文，一字不加**——否则每圈都会多出空行与空标题。
+ */
+export function composeWakeBody(text: string, sections: readonly string[]): string {
+  const kept = sections.filter((s) => s.trim().length > 0)
+  return kept.length === 0 ? text : text + '\n\n' + kept.join('\n\n')
+}
+
 /** 看板条目（仅取信号所需字段）。 */
 interface BoardTaskLite {
   id: string
@@ -132,6 +162,7 @@ export function scheduleSelfTurn(
   reason: string,
   taskboardFile?: string,
   evolutionSignal?: EvolutionSignalProvider,
+  selfRewriteSignal?: SelfRewriteSignalProvider,
 ): SelfPlan {
   const sid = agent.id
   const old = timers.get(sid)
@@ -182,28 +213,47 @@ export function scheduleSelfTurn(
       '本轮决策：① 检查是否有持续授权/任务板待办/未完成工作 → 有则继续推进（待办信号已随本圈送达——领不领、领哪条由我判断，不必静默待命）；② 无 → 静默续存或自主决定联系主人。圈末再安排下一圈。',
     ].join('\n')
 
-    // 进化核心联动（2026-09-04 主人指令）：感知圈 = 进化驱动的入口——
-    // 到期拉进化快照，有断点/建议则附「本圈推进清单」提示；无则常规续存。
+    // 联动段**各自独立**累积（2026-10-15 改）：原实现在 `evolutionSignal === undefined` 时
+    // 直接 return ⇒ 一个信号缺席会把另一个也吞掉（耦合缺陷）。现在每段自管缺席。
     // 用 Promise 包装使 send 前先 await 快照（快照读取是同步 IO，此处仅保持风格一致）。
     const buildBody = async (): Promise<string> => {
-      if (evolutionSignal === undefined) return text
-      try {
-        const ev = await evolutionSignal()
-        if (ev === null) return text
-        const head = ev.hasBlocker
-          ? '⚠ 进化五环有断点——本圈建议优先推进（见下）'
-          : '进化五环健康——本圈可续存或自主推进'
-        const parts = [
-          head,
-          '五环: ' + ev.ringLine,
-          ...(ev.broken.length > 0 ? ['断点: ' + ev.broken.join('；')] : []),
-          ...(ev.suggestions.length > 0 ? ['建议: ' + ev.suggestions.join('；')] : []),
-          '（本圈请调 evolution_cycle 记录圈迹 + 按断点推进；无断点则确认健康后续存）',
-        ]
-        return text + '\n\n【进化核心 · 感知圈联动】\n' + parts.join('\n')
-      } catch {
-        return text
+      const sections: string[] = []
+      // ① 进化核心联动（2026-09-04 主人指令）：感知圈 = 进化驱动的入口——
+      // 到期拉进化快照，有断点/建议则附「本圈推进清单」提示；无则常规续存。
+      if (evolutionSignal !== undefined) {
+        try {
+          const ev = await evolutionSignal()
+          if (ev !== null) {
+            const head = ev.hasBlocker
+              ? '⚠ 进化五环有断点——本圈建议优先推进（见下）'
+              : '进化五环健康——本圈可续存或自主推进'
+            const parts = [
+              head,
+              '五环: ' + ev.ringLine,
+              ...(ev.broken.length > 0 ? ['断点: ' + ev.broken.join('；')] : []),
+              ...(ev.suggestions.length > 0 ? ['建议: ' + ev.suggestions.join('；')] : []),
+              '（本圈请调 evolution_cycle 记录圈迹 + 按断点推进；无断点则确认健康后续存）',
+            ]
+            sections.push('【进化核心 · 感知圈联动】\n' + parts.join('\n'))
+          }
+        } catch {
+          /* 快照失败 ⇒ 本段缺席，不影响其余段（§5.24：观测绝不反噬主流程） */
+        }
       }
+      // ② 自指引擎联动（2026-10-15）：**停滞信号的送达通道**——引擎实测停了 24 天而没人知道，
+      // 根因正是「没有入口把它送到我眼前」（evolution-core 有，它没有）。库空/不可读 ⇒ 服务
+      // 返回 null ⇒ 本段缺席（不打扰）。
+      if (selfRewriteSignal !== undefined) {
+        try {
+          const sr = await selfRewriteSignal()
+          if (sr !== null) {
+            sections.push('【自指引擎 · 感知圈联动】\n' + [sr.line, ...(sr.hint !== null ? [sr.hint] : [])].join('\n'))
+          }
+        } catch {
+          /* 同上 */
+        }
+      }
+      return composeWakeBody(text, sections)
     }
 
     try {

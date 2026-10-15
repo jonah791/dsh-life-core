@@ -19,7 +19,7 @@ import { join } from 'node:path'
 import { loadState, saveState, editSelf, lifeCoreDir } from './state.ts'
 import { appendLifeEvent, readTimeline, rotateTimeline, type LifeEventKind } from './timeline.ts'
 import { installLifeInject } from './inject.ts'
-import { scheduleSelfTurn, markSelfTurnDone, type EvolutionSignalProvider, type EvolutionWakeSignal } from './activate.ts'
+import { scheduleSelfTurn, markSelfTurnDone, type EvolutionSignalProvider, type EvolutionWakeSignal, type SelfRewriteSignalProvider, type SelfRewriteWakeSignal } from './activate.ts'
 // 唤醒回执判定（2026-10-06 t-9262ec22：「已发出」≠「已执行」）
 import { decideWakeAck, WAKE_ACK_TIMEOUT_MS } from './wake-ack.ts'
 // 圈投递目标选举（2026-09-13 主人：「感知圈怎么发到别的会话了」）——见 src/target.ts 头部事故注释
@@ -36,7 +36,8 @@ export const name = 'agent-life-core'
 // evolutionCore：cordis 严格代理——未声明即访问会抛 "cannot get property ...
 // without inject"。声明后提供者（dsh-evolution-core）未挂载时才是 undefined
 // （可选降级语义，与 makeEvolutionSignal 的 svc === undefined 分支一致）。
-export const inject = ['tools', 'agents', 'evolutionCore'] as const
+// selfRewrite（2026-10-15 加）：同理——`dsh-agent-self-rewrite` 提供停滞快照，未挂载即降级。
+export const inject = ['tools', 'agents', 'evolutionCore', 'selfRewrite'] as const
 
 /** 进化核心服务（dsh-evolution-core 提供，感知圈联动；可选——未挂载时降级不带信号） */
 export interface EvolutionCoreServiceRef {
@@ -51,9 +52,30 @@ export interface EvolutionCoreServiceRef {
   name: string
 }
 
+/**
+ * 自指引擎服务（`dsh-agent-self-rewrite` 提供；可选——未挂载时降级不带信号）。
+ *
+ * 只声明**本件消费的那几个字段**（§5.34：禁读别人内部；跨插件契约存引用不存正文）。
+ * 返回 `null` = 库不可读或聚合失败 ⇒ 消费方容错跳过。
+ */
+export interface SelfRewriteServiceRef {
+  snapshot(): Promise<{
+    at: string
+    daysSinceWired: number | null
+    daysSinceEvidence: number | null
+    collecting: number
+    nextUp: { id: string; statement: string; evidence: number; threshold: number; gapRatio: number } | null
+    signal: boolean
+    line: string
+    hint: string | null
+  } | null>
+  name: string
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     evolutionCore?: EvolutionCoreServiceRef
+    selfRewrite?: SelfRewriteServiceRef
   }
 }
 
@@ -125,6 +147,25 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
   const evolutionSignal = makeEvolutionSignal()
+
+  // ---------- 自指引擎联动信号工厂（2026-10-15：停滞信号的送达通道） ----------
+  // ctx.selfRewrite 可选（self-rewrite 未挂载时 undefined → 信号 undefined → 唤醒消息不携带）。
+  // 只在感知圈到期时拉一次（不进每轮注入，零常驻开销）。
+  // ⚠ `!snap.signal` 时返回 null：库空 ⇒ 服务自己判 signal=false（新装不是停滞）⇒ 不打扰。
+  const makeSelfRewriteSignal = (): SelfRewriteSignalProvider | undefined => {
+    const svc = ctx.selfRewrite
+    if (svc === undefined) return undefined
+    return async (): Promise<SelfRewriteWakeSignal | null> => {
+      try {
+        const snap = await svc.snapshot()
+        if (snap === null || !snap.signal) return null
+        return { line: snap.line, hint: snap.hint }
+      } catch {
+        return null
+      }
+    }
+  }
+  const selfRewriteSignal = makeSelfRewriteSignal()
 
   // 装配注入（每轮存在摘要）
   if (config.injectEnabled) installLifeInject(ctx)
@@ -224,7 +265,7 @@ export function apply(ctx: Context, config: Config): void {
       return handle.agent
     },
     wake: (agent: any, reason: string) => {
-      scheduleSelfTurn(agent, 0, reason, config.taskboardFile, evolutionSignal)
+      scheduleSelfTurn(agent, 0, reason, config.taskboardFile, evolutionSignal, selfRewriteSignal)
     },
     log: (msg: string) => logger.info(msg),
   }
@@ -458,7 +499,7 @@ export function apply(ctx: Context, config: Config): void {
         ? '唤醒未被消费（投递 ' + Math.round(ack.waitedMs / 60_000) + ' 分钟无回执）——越过周期闸门重发'
         : '恒定感知周期 ' + cycle + ' 分钟到期（我的呼吸频率）'
       // 到期唤醒（scheduleSelfTurn 内部会做可打断性检查：对话中则跳过，下次再试）
-      scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal)
+      scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal, selfRewriteSignal)
       logger.info('pace: ' + (wakeMissed ? '唤醒未消费 → 强发重试' : '恒定周期到期，唤醒自我感知（cycle=' + cycle + 'min）'))
     } catch (e) {
       // 2026-10-09（round 27 覆盖审计的第③个洞）：原来**只 logger.warn** —— 而本环境 web 进程 stdout
@@ -545,7 +586,7 @@ export function apply(ctx: Context, config: Config): void {
         ? '启动自检：有安排未兑现（已到期待兑现但无自我感知——timer 被重启吞掉），补触发'
         : '启动自检：距上次在场已超 ' + cycle + ' 分钟周期（重启后心跳自愈），补触发'
       // 补圈
-      scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal)
+      scheduleSelfTurn(main, 0, reason, config.taskboardFile, evolutionSignal, selfRewriteSignal)
       appendLifeEvent({
         at: new Date().toISOString(), kind: 'self-turn',
         summary: reason + '（实为 ' + Math.round((nowMs - lastActiveMs) / 60000) + 'min 未在场；上次自我感知圈 '
@@ -640,7 +681,7 @@ export function apply(ctx: Context, config: Config): void {
       const minutes = Math.max(5, Math.min(1440, Math.floor(args.minutes)))
       const reason = (args.reason ?? '').trim()
       if (reason.length === 0) return { ok: false, message: 'reason 必填——自我激活是自主决策，必须留痕' }
-      const plan = scheduleSelfTurn(agent, minutes, reason, config.taskboardFile, evolutionSignal)
+      const plan = scheduleSelfTurn(agent, minutes, reason, config.taskboardFile, evolutionSignal, selfRewriteSignal)
       return { ok: true, message: '已安排自我感知圈：' + minutes + ' 分钟后（' + new Date(plan.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '）。到期我自主醒来，判断这一圈做什么。' }
     },
   }))
