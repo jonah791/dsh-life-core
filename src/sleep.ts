@@ -104,10 +104,32 @@ export function getSleepPlan(sessionId: string): SleepPlan | undefined {
 }
 
 /** Date → 'HH:MM'（本地时区）。 */
-function fmtClock(d: Date): string {
+export function fmtClock(d: Date): string {
   const h = String(d.getHours()).padStart(2, '0')
   const m = String(d.getMinutes()).padStart(2, '0')
   return h + ':' + m
+}
+
+/**
+ * ISO 时间串（`toISOString()` 产出的 **UTC** 形式）→ 本地 'HH:MM'。
+ *
+ * 存在理由（2026-10-29 实测）：`life_core_status` 的 render 曾对 `sleep.until` /
+ * `paceStalledAt` / 时间线 `at` 三处各自就地 `.slice(11, 16)` —— 那截出的是 **UTC
+ * 的小时分钟**，而人读的是本地时刻。本机 UTC+8 下「睡眠至 08:03」被显示成「至 00:03」，
+ * 我据此差点判定「睡眠根本没排上」，白查了 state.json 与决策日志。
+ *
+ * 同错误被写了三遍的根因：`fmtClock` 一直存在且正确（唤醒消息在用），但**没导出**，
+ * render 那边拿不到 ⇒ 三处各自就地截取。单一真源不导出，等于不存在。
+ *
+ * 失败行为：空 → 空串；不可解析 → **原样返回入参**（不伪造 'NaN:NaN'）——
+ * 保留坏值让它在读数里露出来，而不是变成一个看起来正常的时间。
+ */
+export function fmtIsoClock(iso: unknown): string {
+  const raw = String(iso ?? '')
+  if (raw.length === 0) return ''
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return raw
+  return fmtClock(d)
 }
 
 /**

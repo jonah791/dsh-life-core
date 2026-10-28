@@ -24,7 +24,7 @@ import { scheduleSelfTurn, markSelfTurnDone, type EvolutionSignalProvider, type 
 import { decideWakeAck, WAKE_ACK_TIMEOUT_MS } from './wake-ack.ts'
 // 圈投递目标选举（2026-09-13 主人：「感知圈怎么发到别的会话了」）——见 src/target.ts 头部事故注释
 import { electCircleTarget } from './target.ts'
-import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident } from './sleep.ts'
+import { MAX_SLEEP_MINUTES, scheduleSleep, getSleepPlan, readIncident, fmtIsoClock } from './sleep.ts'
 import { attemptColdStartRecovery, COLDSTART_PROBE_INTERVAL_MS, type ColdStartAlert, type ColdStartDeps } from './coldstart.ts'
 // 出外告警（2026-10-09 · t-5fd8f3e9）：判据在 src/absence.ts（纯决策），送达由 dsh-agent-notify 的 notify 服务负责
 import { decideAbsenceAlert, composeAbsenceAlert, absenceInputFrom, absenceThresholdMinutes } from './absence.ts'
@@ -632,18 +632,23 @@ export function apply(ctx: Context, config: Config): void {
         // 于是「安排中的睡眠」「守护事故记录」「最近存在时间线」（工具描述承诺的三项）
         // 只能绕过工具去读 state.json ⇒ 工具自证能力名不副实（§5.22 规则 1）。
         // ⚠ 注意：宣言那 40 字是**有意的预览**，不是截断——别再把它读成故障。
+        // 时间一律走 fmtIsoClock（本地 HH:MM）：此处曾三处各自就地截取 ISO 串的
+        // 第 12~16 位——那是 UTC 的小时分钟，「睡眠至 08:03」被显示成「至 00:03」，
+        // 我据此差点判定「睡眠根本没排上」并白查 state.json 与决策日志（2026-10-29 实测）。
+        // ⚠ 措辞也一并修正：原写「睡眠中」不成立——能调到本工具就说明我醒着，
+        //   它描述的是「已安排、未到期」。
         const lines = [
-          (v.state?.paceStalledAt ? '⚠ 感知圈停摆（自 ' + String(v.state.paceStalledAt).slice(11, 16) + '，连续跳过 ' + (v.state?.paceSkipStreak ?? 0) + ' 次）· ' : '')
+          (v.state?.paceStalledAt ? '⚠ 感知圈停摆（自 ' + fmtIsoClock(v.state.paceStalledAt) + '，连续跳过 ' + (v.state?.paceSkipStreak ?? 0) + ' 次）· ' : '')
             + '存在状态：' + (v.state?.status ?? '?')
             + ' · 今日 ' + (v.state?.todayTurns ?? 0) + ' 圈'
             + ' · 周期 ' + (v.state?.cycleMinutes ?? '?') + 'min'
             + ' · 跳过 ' + (v.state?.paceSkipStreak ?? 0) + ' 次'
             + ' · 宣言：' + String(v.state?.self?.creed ?? '').slice(0, 40),
-          v.sleep ? '睡眠中：至 ' + String(v.sleep.until).slice(11, 16) + '（' + String(v.sleep.reason) + '）' : '未安排睡眠',
+          v.sleep ? '已安排睡眠：至 ' + fmtIsoClock(v.sleep.until) + '（' + String(v.sleep.reason) + '）' : '未安排睡眠',
           v.incident ? '⚠ 守护事故：' + String(v.incident) : '守护事故：无',
         ]
         for (const e of (v.timeline ?? [])) {
-          lines.push('· ' + String(e.at ?? '').slice(11, 16) + ' [' + String(e.kind ?? '?') + '] ' + String(e.summary ?? '').slice(0, 70))
+          lines.push('· ' + fmtIsoClock(e.at) + ' [' + String(e.kind ?? '?') + '] ' + String(e.summary ?? '').slice(0, 70))
         }
         return [{ type: 'text', text: lines.join('\n') }]
       },
