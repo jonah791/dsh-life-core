@@ -16,6 +16,9 @@ import { join } from 'node:path'
 import { lifeCoreDir } from './state.ts'
 import { appendLifeEvent } from './timeline.ts'
 import { pendingTaskSignal, wasInterrupted } from './activate.ts'
+// 停滞信号（2026-11-01，P1）：与感知圈共用同一个 cursor ⇒ 睡眠期间变超期的也算「新变」，
+// 不会因为「那一圈我在睡」而漏掉一次边沿
+import { staleSignal, cursorPathFor } from './stale-signal.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -147,7 +150,13 @@ function buildWakeText(elapsedMin: number, from: Date, to: Date, newEvents: numb
   // 睡眠期间任务板可能积压——醒来即见待办信号（2026-09-01 主人定调：领取由生命核心驱动）
   const pending = taskboardFile === undefined ? undefined : pendingTaskSignal(taskboardFile)
   const pendingSection = pending === undefined ? '' : '\n' + pending
-  return '[life] 睡眠到期，你睡了 ' + dur + '（' + fmtClock(from) + ' → ' + fmtClock(to) + '）。期间会话新增 ' + newEvents + ' 条事件。请继续。' + incident + pendingSection
+  // 停滞信号（2026-11-01，P1）：与感知圈同一个 cursor，睡醒时把睡眠期间**新变超期**的带出来。
+  // 无新账 / 首轮 / 读失败一律空串——醒来消息不该因为没新账而变长。
+  const stale = taskboardFile === undefined
+    ? undefined
+    : staleSignal(taskboardFile, cursorPathFor(taskboardFile), { nowMs: Date.now() })
+  const staleSection = stale === undefined ? '' : '\n' + stale
+  return '[life] 睡眠到期，你睡了 ' + dur + '（' + fmtClock(from) + ' → ' + fmtClock(to) + '）。期间会话新增 ' + newEvents + ' 条事件。请继续。' + incident + pendingSection + staleSection
 }
 
 /** 读取守护事故记录（life_core_status 呈现用；无文件返回 null）。 */

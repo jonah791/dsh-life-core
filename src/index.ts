@@ -48,8 +48,32 @@ export interface EvolutionCoreServiceRef {
     broken: Array<{ ring: string; state: string; signal: string; suggestion: string }>
     suggestions: string[]
     organLines: string[]
+    /** 推进读数（2026-11-02 加；老版本 provider 可能没有 ⇒ 消费方判 undefined 跳过） */
+    progress?: ProgressRef
+    progressLine?: string
   } | null>
+  /**
+   * 轻量推进读数（2026-11-02 加）。只读 history.jsonl，不做全量器官聚合。
+   * 未挂载 / disabled ⇒ null。
+   */
+  progress?(): Promise<ProgressRef | null>
   name: string
+}
+
+/**
+ * 推进读数的最小形态（跨插件只声明消费的字段，§5.34 禁读别人内部）。
+ *
+ * 分工：`stale` 回答「该不该动」，`creditlessStreak` 回答「动了算不算数」。
+ */
+export interface ProgressRef {
+  lastAdvanceAt: string | null
+  hoursSinceAdvance: number | null
+  advanceCount7d: number
+  advanceTotal: number
+  creditedTotal: number
+  creditlessStreak: number
+  stale: boolean
+  idleHours: number
 }
 
 /**
@@ -140,6 +164,8 @@ export function apply(ctx: Context, config: Config): void {
           ringLine,
           broken,
           suggestions: snap.suggestions.slice(0, 3),
+          // 推进读数（2026-11-02）：provider 老版本不给 ⇒ undefined ⇒ 该段缺席（不打扰）
+          progress: snap.progress,
         }
       } catch {
         return null

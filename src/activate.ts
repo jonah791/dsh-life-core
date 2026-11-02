@@ -15,6 +15,8 @@ import { loadState, saveState } from './state.ts'
 import { appendLifeEvent } from './timeline.ts'
 import { SELF_TURN_MARK } from './inject.ts'
 import { decidePaceSkip, PACE_HEALTHY } from './pace.ts'
+// 停滞信号（2026-11-01，P1）：边沿触发，只报「新变超期」——见 src/stale-signal.ts 头注
+import { staleSignal, cursorPathFor } from './stale-signal.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -81,6 +83,21 @@ export interface EvolutionWakeSignal {
   broken: string[]
   /** 建议动作（≤3 条，防刷屏） */
   suggestions: string[]
+  /**
+   * 推进读数（2026-11-02 加，可选——老 provider 不提供则本段缺）。
+   *
+   * 为什么需要它：本信号原有的两态判据（有红断点 / 五环健康）**测不出惰性**。
+   * 红环是异常检测；不推进是正常态的常态。2026-11-02 实测：一天 16 圈全部落进
+   * 「五环健康 ⇒ 可续存或自主推进」，履历 20 条动作里「我来过」占 13 条。
+   */
+  progress?: {
+    hoursSinceAdvance: number | null
+    advanceTotal: number
+    advanceCount7d: number
+    creditlessStreak: number
+    stale: boolean
+    idleHours: number
+  }
 }
 
 /** 拉进化快照的函数类型（index.ts 注入 ctx.evolutionCore 闭包） */
@@ -203,11 +220,19 @@ export function scheduleSelfTurn(
     const state = loadState()
     // 任务领取由本圈驱动（2026-09-01 主人定调）：待办信号随唤醒送达，是否领取归我判断
     const pending = taskboardFile === undefined ? undefined : pendingTaskSignal(taskboardFile)
+    // 停滞信号（2026-11-01，P1）：**边沿触发**——只报「自上次检查以来新变超期」的任务。
+    // 为什么不是「超阈值就报」：那天板面 33 条里 30 条超期（91%），每圈全报就是噪音，
+    // 而新变超期的那几条混在里头看不出来。老账归「收工盘点」，不归告警。
+    // 无新账 / 首轮 / 读失败一律返回 undefined（零噪音）。
+    const stale = taskboardFile === undefined
+      ? undefined
+      : staleSignal(taskboardFile, cursorPathFor(taskboardFile), { nowMs: Date.now() })
     const text = [
       SELF_TURN_MARK + '（' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '）',
       '这是我自己安排的这一圈。存在摘要：' + state.status + ' · 今日第 ' + state.todayTurns + ' 圈 · 距离上次对话 ' + state.idleMinutes + ' 分钟。',
       '我的牵挂：' + (state.self.concerns.length > 0 ? state.self.concerns.join(' / ') : '无特别牵挂') + '。',
       ...(pending === undefined ? [] : [pending]),
+      ...(stale === undefined ? [] : [stale]),
       // 2026-08-30 主人定调修复：感知圈决策缺「持续授权继续推进」分支——主人「在我说停止前持续提升」时，
       // 我默认选静默续存待命 = 约 1 小时停一次。现在先检查是否有持续授权/待办/未完成工作在推进。
       '本轮决策：① 检查是否有持续授权/任务板待办/未完成工作 → 有则继续推进（待办信号已随本圈送达——领不领、领哪条由我判断，不必静默待命）；② 无 → 静默续存或自主决定联系主人。圈末再安排下一圈。',
@@ -224,12 +249,27 @@ export function scheduleSelfTurn(
         try {
           const ev = await evolutionSignal()
           if (ev !== null) {
+            const p = ev.progress
+            // 三态（2026-11-02）：补「推进」这一维。原两态只认红断点，
+            // 而红环是**异常检测**、不推进是**正常态的惰性** ⇒ 正常态永远落进「可续存」。
+            // 实测代价：2026-11-02 一天 16 圈全部合法续存。
+            const advanceLine = p === undefined
+              ? null
+              : (p.advanceTotal === 0
+                ? '推进: 从未有一次推进（cycle 不算——它只证明我来过）'
+                : '推进: ' + (p.hoursSinceAdvance === null ? '?' : String(p.hoursSinceAdvance)) + 'h 前'
+                  + '（7 天 ' + String(p.advanceCount7d) + ' 次 · 累计 ' + String(p.advanceTotal) + '）'
+                  + (p.creditlessStreak >= 1 ? ' · 连续 ' + String(p.creditlessStreak) + ' 条无证据' : ''))
+            const stale = p !== undefined && p.stale
             const head = ev.hasBlocker
-              ? '⚠ 进化五环有断点——本圈建议优先推进（见下）'
-              : '进化五环健康——本圈可续存或自主推进'
+              ? '⚠ 进化五环有断点——本圈优先推进断点（见下）'
+              : (stale
+                ? '⚠ 已超过 ' + String(p?.idleHours ?? 0) + ' 小时没有推进——本圈必须产出一条推进（wire / verdict / forge / reflect 之一，带证据指针），「续存」不是本圈的选项'
+                : '刚推进过——本圈可续存或自主推进')
             const parts = [
               head,
               '五环: ' + ev.ringLine,
+              ...(advanceLine === null ? [] : [advanceLine]),
               ...(ev.broken.length > 0 ? ['断点: ' + ev.broken.join('；')] : []),
               ...(ev.suggestions.length > 0 ? ['建议: ' + ev.suggestions.join('；')] : []),
               '（本圈请调 evolution_cycle 记录圈迹 + 按断点推进；无断点则确认健康后续存）',

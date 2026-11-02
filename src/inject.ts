@@ -10,6 +10,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import { loadState, recordTurn } from './state.ts'
 import { isUserSession } from './target.ts'
+import type { ProgressRef } from './index.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -21,6 +22,21 @@ export const SELF_TURN_MARK = '[life-core] 自我感知'
 
 export function isSelfTurn(text: string): boolean {
   return typeof text === 'string' && text.includes(SELF_TURN_MARK)
+}
+
+/**
+ * 推进读数的一句话（只消费 ProgressRef 的字段，不复制 provider 的渲染逻辑）。
+ *
+ * 为什么必须极简：这一行**每轮都会出现**，主人 2026-08-25 明确反馈过「信息太多干扰阅读」。
+ * 所以正常态只留最少的字（「12h 前推进」），只有需要推进时才长出警示尾巴。
+ */
+function renderProgressBrief(p: ProgressRef): string {
+  if (p.advanceTotal === 0) return '从未推进 ⚠'
+  const h = p.hoursSinceAdvance === null ? '?' : String(Math.round(p.hoursSinceAdvance))
+  const stale = p.stale ? ' ⚠该推进了' : ''
+  // 无证据只在已经攒了 3 条以上时才提（1~2 条是正常抖动，天天报会脱敏）
+  const credit = p.creditlessStreak >= 3 ? `（连续 ${p.creditlessStreak} 条无证据）` : ''
+  return `${h}h 前推进${stale}${credit}`
 }
 
 /**
@@ -63,9 +79,21 @@ export function installLifeInject(ctx: Context): void {
     const state = loadState()
     recordTurn(state)
 
-    // 极简注入：宣言 + 状态一行，不携带时间线历史
+    // 极简注入：宣言 + 状态一行 + 推进读数，不携带时间线历史
+    // 2026-11-02 加第三段（自进化进 loop 的落点）：每轮都看见「距上次推进多久」。
+    // 原判据只有感知圈的两态（有红断点/五环健康），而不推进是**正常态的惰性**——
+    // 正常态永远落进「可续存」，于是 16 圈全合法续存、履历里全是「我来过」。
+    // 挂在这里的理由：`agent/pre-step` 是我每次必然经过的动作（§3.4「结构 vs 记性」）。
+    let progressSuffix = ''
+    try {
+      const p = await ctx.evolutionCore?.progress?.()
+      if (p !== null && p !== undefined) progressSuffix = ' ｜ 进化：' + renderProgressBrief(p)
+    } catch {
+      // 读数取不到不影响存在注入：读数是增值项，不是存在的前置条件（降级必须真的更宽）
+    }
     const text = '【存在·生命状态】' + state.self.creed
       + ' ｜ 清醒 · 今日第 ' + state.todayTurns + ' 圈 · ' + hourKey.split(' ')[1]
+      + progressSuffix
 
     const msg = createUserMessage({
       content: [{ type: 'text', text }],
