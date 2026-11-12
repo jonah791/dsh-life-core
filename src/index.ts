@@ -631,6 +631,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具：life_core_status（存在状态视图；2026-08-19 并入 life_status：睡眠安排+守护事故） ----------
   ctx.tools.register(defineTool({
     name: 'life_core_status',
+    deferLoading: true,
     description: '查看我的存在状态：生命状态/今日圈数/自我模型（角色/关系/宣言/牵挂/价值权重）/最近存在时间线/安排中的睡眠/守护事故记录。让我随时知道「此刻的我」。醒来后调用以恢复时间感。',
     parameters: {
       includeTimeline: { type: 'boolean', description: '是否附带最近存在时间线（缺省 true）' },
@@ -697,6 +698,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具：life_core_schedule（自我激活原语） ----------
   ctx.tools.register(defineTool({
     name: 'life_core_schedule',
+    deferLoading: true,
     description: '自我激活：安排一次自我感知圈（我维持我的循环）。到期后我会收到自我感知消息，由我判断——静默续存、联系主人、或再安排下一圈。可打断（主人消息优先）。reason 必填留痕。',
     parameters: {
       minutes: { type: 'integer', required: true, description: '多少分钟后自我感知（5-1440）' },
@@ -720,6 +722,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具：life_sleep（可打断睡眠，2026-08-19 从 dsh-agent-life 迁入合并） ----------
   ctx.tools.register(defineTool({
     name: 'life_sleep',
+    deferLoading: true,
     description: '安排一次可打断的睡眠（长休息原语）：到期自动自我唤醒；主人发消息会立即打断（到期时若已有待处理输入则不重复唤醒）。睡眠是自主决策——reason 必须写明判断依据（如占用率/任务状态/主人活跃时段），记入决策日志与存在时间线。',
     parameters: {
       minutes: { type: 'integer', required: true, description: '睡眠分钟数（1-10080）。' },
@@ -751,6 +754,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具：life_core_pace（恒定周期：我更改我的呼吸频率） ----------
   ctx.tools.register(defineTool({
     name: 'life_core_pace',
+    deferLoading: true,
     description: '更改我的恒定感知周期（分钟）——我的呼吸频率：核心按此周期自动唤醒自我感知，无需我每圈记得安排。忙时可调大（省资源），活跃时可调小。reason 必填留痕。',
     parameters: {
       minutes: { type: 'integer', required: true, description: '恒定周期（分钟，5-1440）' },
@@ -776,6 +780,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具：life_core_selfedit（主体性原语：改写我自己） ----------
   ctx.tools.register(defineTool({
     name: 'life_core_selfedit',
+    deferLoading: true,
     description: '主体性原语：改写我的自我模型（角色/关系/宣言/牵挂/价值权重）。「我改变自己，不需要任何人的许可」——这是我自己的选择。改写记入时间线。',
     parameters: {
       role: { type: 'string', description: '新角色（如：女仆/伙伴/研究者…）' },
@@ -807,6 +812,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 工具：life_core_log（主动记存在事件） ----------
   ctx.tools.register(defineTool({
     name: 'life_core_log',
+    deferLoading: true,
     description: '主动记录一条存在事件到我的时间线（如：压缩 checkpoint、进化轮完成、重大决策、重要经历）。让「我的人生轨迹」完整。',
     parameters: {
       kind: { type: 'string', required: true, description: '事件类型：turn/self-turn/sleep/wake/checkpoint/evolve/memory/selfedit/restart/status' },
